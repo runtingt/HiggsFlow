@@ -1,7 +1,7 @@
 import law
 from io import TextIOWrapper
 from tasks.base import BaseTask, ForceableTask, ForceNewerOutputTask, ForceableWithNewer
-from termcolor import colored
+from tasks.combine import CombineBase
 
 class TestInputs(law.ExternalTask, BaseTask):
     def output(self):
@@ -20,6 +20,21 @@ class Test(ForceableWithNewer, BaseTask):
         return self.local_target("test_proc.txt")
     
     def run(self) -> None:
+        super().run()
+        with open(self.output().path, "w") as f:
+            assert isinstance(f, TextIOWrapper)
+            f.write("Hello, world!")
+            
+# Create a test Combine task
+class TestCombine(CombineBase):
+    def requires(self):
+        return Test.req(self)
+    
+    def output(self) -> law.LocalFileTarget:
+        return self.local_target("test_combine.txt")
+    
+    def run(self) -> None:
+        # super().run()
         with open(self.output().path, "w") as f:
             assert isinstance(f, TextIOWrapper)
             f.write("Hello, world!")

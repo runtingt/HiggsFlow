@@ -3,11 +3,10 @@ import law
 import luigi
 import numpy as np
 from typing import Dict, List, Tuple, Union
-from termcolor import colored
 from law.task.base import BaseTask as LawBaseTask # For proper type-hinting
 from law.logger import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger('luigi-interface')
 
 # Get a list of targets from a dict, list, tuple, or single target
 def targetAsList(target: Union[Dict, List, Tuple, law.LocalFileTarget]) -> List[law.LocalFileTarget]:
@@ -28,13 +27,14 @@ class BaseTask(law.Task, LawBaseTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Create the output directory if it doesn't exist
-        logger.info(f"Creating directory {os.path.expandvars(self.local_path())}")
-        os.makedirs(os.path.expandvars(self.local_path()), exist_ok=True)
+        expanded_path = os.path.expandvars(self.local_path())
+        logger.debug(f"Attempting to create directory {expanded_path}")
+        os.makedirs(expanded_path, exist_ok=True)
 
     # Helper methods for defining local paths and targets 
     def local_path(self, *path) -> str:        
         # $DATA_PATH is set in setup.sh
-        parts = ("$DATA_PATH",) + (self.__class__.__name__,) + path
+        parts = (os.getenv("DATA_PATH"),) + (self.__class__.__name__,) + path
         return os.path.join(*parts)
     def local_target(self, *path) -> law.LocalFileTarget:
         return law.LocalFileTarget(self.local_path(*path))
@@ -43,8 +43,15 @@ class BaseTask(law.Task, LawBaseTask):
 class ForceableTask(BaseTask):
     force = luigi.BoolParameter(default=False, description="Force the task to run. Default is False.")
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.has_run = False
+    
+    def run(self): # NOTE: This must be called by the derived class
+        self.has_run = True
+    
     def complete(self):
-        if self.force:
+        if self.force and not self.has_run:
             logger.debug(f"Forcing task {self.__class__.__name__} to run")
             return False
         else:
@@ -52,6 +59,9 @@ class ForceableTask(BaseTask):
 
 # Define a task that forces the outputs to be newer than the inputs
 class ForceNewerOutputTask(BaseTask):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
     def complete(self):
         # Check if the outputs are newer than the inputs
         inputs = self.input()
@@ -65,6 +75,8 @@ class ForceNewerOutputTask(BaseTask):
         # Get targets as lists
         inputs_list = targetAsList(inputs)
         outputs_list = targetAsList(outputs)
+        print(inputs_list)
+        print(outputs_list)
 
         # Check if files exist
         for input in inputs_list:
@@ -95,8 +107,12 @@ class ForceNewerOutputTask(BaseTask):
         else:
             return BaseTask.complete(self)
 
+# Combine forceability and newer-output checking
 class ForceableWithNewer(ForceableTask, ForceNewerOutputTask):
     force = luigi.BoolParameter(default=False, description="Force the task to run. Default is False.")
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
     
     def complete(self):
         flag = ForceableTask.complete(self)
@@ -104,4 +120,7 @@ class ForceableWithNewer(ForceableTask, ForceNewerOutputTask):
             return False
         else:
             return ForceNewerOutputTask.complete(self)
+        
+    def run(self):
+        super().run() # Call the ForceableTask run method
 
