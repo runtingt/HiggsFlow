@@ -1,5 +1,6 @@
 .law/
 __pycache__/
+combine_logger.out
 
 # Ignore everything in the data directory
 data/*
