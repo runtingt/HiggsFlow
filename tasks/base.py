@@ -117,7 +117,10 @@ class ForceableWithNewer(ForceableTask, ForceNewerOutputTask):
         if not flag:
             return False
         else:
-            return ForceNewerOutputTask.complete(self)
+            flag = ForceNewerOutputTask.complete(self)
+            if not flag:
+                logger.debug(f"Task {self.__class__.__name__} is out of date")
+            return flag
         
     def run(self):
         super().run() # Call the ForceableTask run method
