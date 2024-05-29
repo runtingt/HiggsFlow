@@ -21,7 +21,7 @@ logger = get_logger('luigi-interface')
 
 # The derived classes then actually run the command
 
-class CombineBase(BaseTask):
+class CombineBase(ForceableWithNewer):
     # Define common parameters
     MH = luigi.FloatParameter(
         default="125.38",
@@ -104,7 +104,7 @@ class InputFiles(law.ExternalTask, CombineBase):
         files = {"datacard": datacard, "roo_inputs": roo_inputs}
         return files
     
-class TextToWorkspace(CombineBase, ForceableWithNewer):
+class TextToWorkspace(CombineBase):
     """
     Convert a text file and an input file to a RooWorkspace.
     """
@@ -146,7 +146,7 @@ class TextToWorkspace(CombineBase, ForceableWithNewer):
         )
         self.run_cmd(cmd)
 
-class InitialFit(CombineBase, ForceableWithNewer, HTCondorCPU, law.LocalWorkflow):    
+class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):    
     def create_branch_map(self):
         return [None] # Single branch, no special data
     
@@ -186,6 +186,7 @@ class InitialFit(CombineBase, ForceableWithNewer, HTCondorCPU, law.LocalWorkflow
         cmd += f"mv {self.output()['tree'].basename} {self.output()['tree'].path};"
         self.run_cmd(cmd)
 
+# TODO refactor so that only the base class is here. We will define all the scans (and the factory) in a separate file
 class ScanBase(CombineBase, HTCondorCPU, law.LocalWorkflow):
     """
     Base class for running a scan
@@ -199,15 +200,20 @@ class ScanBase(CombineBase, HTCondorCPU, law.LocalWorkflow):
         default=1,
         description="number of points to run per job; default is 1"
     )
+
+    scan_method = luigi.Parameter(
+        default="grid",
+        description="scan method to use; default is grid"
+    )
     
     def create_branch_map(self):
         return {i: i for i in range(int(np.ceil(self.n_points / self.points_per_job)))}
     
     def workflow_requires(self):
-        return [] 
+        return {'init': InitialFit.req(self)} # No unique requirements per-branch
     
     def requires(self):
-        return InitialFit.req(self)
+        return None # No unique requirements per-branch
     
 class ScanPOIBase(ScanBase):
     """
@@ -216,11 +222,6 @@ class ScanPOIBase(ScanBase):
     poi = luigi.Parameter(
         default="r",
         description="parameter of interest to scan; default is r"
-    )
-    
-    scan_method = luigi.Parameter(
-        default="grid",
-        description="scan method to use; default is grid"
     )
     
     def __init__(self, *args, **kwargs):
@@ -279,3 +280,25 @@ class ScanPOIGrid(ScanPOIBase):
         )
         cmd += f"mv {self.output().basename} {self.output().path}"
         self.run_cmd(cmd)
+
+class ScanPOI(ScanPOIGrid):
+    """
+    Factory class for creating scan tasks
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._scan_classes = {
+            'grid': ScanPOIGrid
+            # TODO add scan from file that supports reading in from a file (which can be specified in a similar way to the factory)
+        }
+        self.create_scan(*args, **kwargs)
+    
+    def create_scan(self, *args, **kwargs):
+        scan_class = self._scan_classes.get(self.scan_method)
+        if scan_class is None:
+            raise ValueError(f"Scan method {self.scan_method} not recognised.")
+        self.scan = scan_class(*args, **kwargs)
+    
+    def run(self):
+        self.scan.run()
+    
