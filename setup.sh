@@ -31,6 +31,18 @@ action() {
     export DATA_PATH="${ANALYSIS_PATH}/data"
     export CMSSW_PATH="/home/hep/tr1123/CMSSW_14_0_0_pre0/src" # TODO get this from the user
 
+    # Setup EOS
+    echo -e "${GREEN}Getting kerberos ticket for EOS transfer...${NC}"
+    export EOS_PATH="/eos/user/t/trunting/www/HiggsFlow" # TODO get this from the user
+    # kinit to get a kerberos ticket, if one doesn't exist already
+    if ! klist | grep -q CERN.CH; then
+        echo -e "${RED}No kerberos ticket found. Running kinit to get a ticket.${NC}"
+        kinit -f trunting@CERN.CH # TODO get this from the user
+        echo -e "${GREEN}Got kerberos ticket.${NC}"
+    else
+        echo -e "${GREEN}Kerberos ticket found.${NC}"
+    fi
+
     # Set up law completion
     echo -e "${GREEN}Setting up law completion...${NC}"
     local law_completion="$( law completion )"
