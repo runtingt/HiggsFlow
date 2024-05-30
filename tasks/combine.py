@@ -4,6 +4,7 @@ import law
 import luigi
 import shutil
 import numpy as np
+from io import TextIOWrapper
 from typing import Dict
 from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, SetSMVals, GetPOIRanges, GetFreezeList, GetGeneratePOIs
 from tasks.base import BaseTask, ForceableWithNewer
@@ -186,11 +187,15 @@ class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):
         cmd += f"mv {self.output()['tree'].basename} {self.output()['tree'].path};"
         self.run_cmd(cmd)
 
-# TODO refactor so that only the base class is here. We will define all the scans (and the factory) in a separate file
-class ScanBase(CombineBase, HTCondorCPU, law.LocalWorkflow):
+class POITask(CombineBase):
     """
-    Base class for running a scan
+    Base class for tasks that work with POIs
     """
+    pois = luigi.Parameter(
+        default="r",
+        description="comma-separaterd POIs to scan; default is r"
+    )
+    
     n_points = luigi.IntParameter(
         default=10,
         description="number of points to run; default is 10"
@@ -206,99 +211,203 @@ class ScanBase(CombineBase, HTCondorCPU, law.LocalWorkflow):
         description="scan method to use; default is grid"
     )
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Process pois
+        self.pois_split = str(self.pois).split(',')
+        self.POIS_TO_RUN = " ".join([f"-P {poi}" for poi in self.pois_split])
+        self.POI_NAME_STR = "_".join(self.pois_split)
+        for poi in self.pois_split:
+            assert poi in self.COMBINE_POIS.split(','), f"POI {poi} not in model POIs {self.COMBINE_POIS}"
+    
+class GenerateRandom(CombineBase):
+    def __init__(self, *args, **kwargs):
+        self.pois = str(kwargs.pop("pois", "r")).split(',')
+        self.n_points = kwargs.pop("n_points", 10)
+        super().__init__(*args, **kwargs)
+    
+    def output(self):
+        return self.local_target(f"random_points_{'_'.join(self.pois)}.txt")
+    
+    def run(self):
+        # Get poi bounds
+        bound_strs = self.COMBINE_RANGES.split(':')
+        bounds = []
+        for poi, bound_str in zip(self.pois, bound_strs):
+            assert poi in bound_str, f"{self.pois} does not match {bound_strs}"
+            lo, hi = map(float, bound_str.strip(poi+'=').split(','))
+            bounds.append(np.array([lo, hi]))
+        bounds = np.array(bounds)
+        
+        # Generate random points in the bounds
+        points = np.random.uniform(bounds[:,0], bounds[:,1], (self.n_points, len(self.pois)))
+
+        # Write to output as csv with pois as columns
+        with open(self.output().path, 'w') as f:
+            assert isinstance(f, TextIOWrapper)
+            f.write(','.join(self.pois) + '\n')
+            for point in points:
+                f.write(','.join(map(str, point)) + '\n')
+
+class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
+    """
+    Class for running a POI scan
+    """
+    
     def create_branch_map(self):
         return {i: i for i in range(int(np.ceil(self.n_points / self.points_per_job)))}
     
     def workflow_requires(self):
-        return {'init': InitialFit.req(self)} # No unique requirements per-branch
+        reqs = {'init': InitialFit.req(self)}
+        if self.scan_method == 'rand':
+            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points)
+        return reqs
     
     def requires(self):
-        return None # No unique requirements per-branch
-    
-class ScanPOIBase(ScanBase):
-    """
-    Base class for running a single-POI scan
-    """
-    poi = luigi.Parameter(
-        default="r",
-        description="parameter of interest to scan; default is r"
-    )
+        reqs = {'init': InitialFit.req(self)}
+        if self.scan_method == 'rand':
+            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points)
+        return reqs
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        # Process arguments
+        self.scan_algos = {
+            'grid': 'grid',
+            'rand': 'fixed'
+        }
+        self.algo = self.scan_algos.get(self.scan_method)
+        if self.algo is None:
+            raise ValueError(f"Scan method {self.scan_method} not recognised")
+        if self.scan_method == 'rand':
+            file_target = self.input()['file']
+            assert isinstance(file_target, law.LocalFileTarget)
+            self.file = file_target.path
+        else:
+            self.file = None
+        self.FILE_STR = f"--fromfile {self.file}" if self.file is not None else ""
         
         self.start = self.branch * self.points_per_job
-        self.end = min(self.start + (self.points_per_job-1), self.n_points)
+        self.end = min(self.start + (self.points_per_job-1), self.n_points-1)
         
-    def output(self):
-        return self.local_target(f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.poi}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        # Define the base command, handling only the branches, not the workflow itself
+        if self.branch != -1:
+            target = self.input()['init']['tree']
+            assert isinstance(target, law.LocalFileTarget)
+            self.initial_path = target.path
         
-class ScanPOIGrid(ScanPOIBase):
-    """
-    Derived class for scanning a single poi using a grid
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **dict(kwargs, scan_method="grid"))
-        
-    def run(self):
-        logger.info(f"Running: ScanPOIGrid for {self.poi}, will output {self.output()}")        
-        initial_fit_target = self.input()['tree']
-        assert isinstance(initial_fit_target, law.LocalFileTarget)
-        initial_path = initial_fit_target.path
-
-        # Build strings
-        # TODO offload to parent class
-        SKIP_OPTIONS = "--skipInitialFit"
-        
-        GENERATE_STR = "d;D;n;"
-        if 'observed' in self.types: GENERATE_STR += f";{initial_path},data_obs,observed"
-        if 'prefit_asimov' in self.types: GENERATE_STR += f";{initial_path},toys/toy_asimov,prefit_asimov"
-        if 'postfit_asimov' in self.types: GENERATE_STR += f";{initial_path},toys/toy_asimov,postfit_asimov"
-        
-        ATTRIBUTES_STR = "freezeWithAttributes;n;"
-        if "nominal" in self.attributes: ATTRIBUTES_STR += ";,nominal"
-        if "fr.all" in self.attributes: ATTRIBUTES_STR += ";all,fr.all"
-        if "fr.sigth" in self.attributes: ATTRIBUTES_STR += ";sigTheory,fr.sigth"
-        if "fr.sigbkgth" in self.attributes: 
-            # Requires doubling of commas to account for two frozen attributes
-            ATTRIBUTES_STR = re.sub(",", ",,", ATTRIBUTES_STR)
-            ATTRIBUTES_STR += ";sigTheory,bkgTheory,,fr.sigbkgth"
-
-        # TODO offload to parent class
-        cmd = self.base_command
-        cmd += (
+            # Build strings
+            self.SKIP_OPTIONS = "--skipInitialFit"
+            self.GENERATE_STR = "d;D;n;"
+            if 'observed' in self.types: self.GENERATE_STR += f";{self.initial_path},data_obs,observed"
+            if 'prefit_asimov' in self.types: self.GENERATE_STR += f";{self.initial_path},toys/toy_asimov,prefit_asimov"
+            if 'postfit_asimov' in self.types: self.GENERATE_STR += f";{self.initial_path},toys/toy_asimov,postfit_asimov"
+            
+            self.ATTRIBUTES_STR = "freezeWithAttributes;n;"
+            if "nominal" in self.attributes: self.ATTRIBUTES_STR += ";,nominal"
+            if "fr.all" in self.attributes: self.ATTRIBUTES_STR += ";all,fr.all"
+            if "fr.sigth" in self.attributes: self.ATTRIBUTES_STR += ";sigTheory,fr.sigth"
+            if "fr.sigbkgth" in self.attributes: 
+                # Requires doubling of commas to account for two frozen attributes
+                self.ATTRIBUTES_STR = re.sub(",", ",,", self.ATTRIBUTES_STR)
+                self.ATTRIBUTES_STR += ";sigTheory,bkgTheory,,fr.sigbkgth"
+            self.GENERATOR = f"\"{self.GENERATE_STR}\" \"{self.ATTRIBUTES_STR}\" {self.FILE_STR}"
+            
+    def build_command(self):
+        self.cmd = self.base_command
+        self.cmd += (
             f" {self.time_command} combineTool.py -M MultiDimFit -m {self.MH}"
-            f" --generate \"{GENERATE_STR}\" \"{ATTRIBUTES_STR}\""# \"{self.COMBINE_POIS_TO_RUN}\""
+            f" --generate {self.GENERATOR}"
             f" --freezeParameters MH{self.COMBINE_FREEZE} --redefineSignalPOIs {self.COMBINE_POIS}"
             f" --setParameterRanges {self.COMBINE_RANGES} {self.COMBINE_OPTIONS}"
-            f" -n .scan.{self.channel}.{self.model}.{self.scan_method}.{self.poi}.POINTS.{self.start}.{self.end}"
-            f" --snapshotName \"MultiDimFit\" --algo grid --saveInactivePOI 1"
-            f" {SKIP_OPTIONS} {self.COMBINE_SET_OPTIONS}"
-            f" --points {self.n_points} --alignEdges 1 -P {self.poi}"
+            f" -n .scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}"
+            f" --snapshotName \"MultiDimFit\" --algo {self.algo} --saveInactivePOI 1"
+            f" {self.SKIP_OPTIONS} {self.COMBINE_SET_OPTIONS}"
+            f" --points {self.n_points} --alignEdges 1 {self.POIS_TO_RUN}"
             f" --firstPoint {self.start} --lastPoint {self.end}"
-            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.poi}_local.log;"
+            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}_local.log;"
         )
-        cmd += f"mv {self.output().basename} {self.output().path}"
-        self.run_cmd(cmd)
-
-class ScanPOI(ScanPOIGrid):
-    """
-    Factory class for creating scan tasks
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._scan_classes = {
-            'grid': ScanPOIGrid
-            # TODO add scan from file that supports reading in from a file (which can be specified in a similar way to the factory)
-        }
-        self.create_scan(*args, **kwargs)
-    
-    def create_scan(self, *args, **kwargs):
-        scan_class = self._scan_classes.get(self.scan_method)
-        if scan_class is None:
-            raise ValueError(f"Scan method {self.scan_method} not recognised.")
-        self.scan = scan_class(*args, **kwargs)
+        
+        if self.file is not None:
+            input_files = ""
+            for i in range(self.start, self.end + 1):
+                input_files += os.path.join(os.getenv('ANALYSIS_PATH'), 
+                                            f'higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.POINTS.{i}.{i}.MultiDimFit.mH125.38.root ')
+            self.cmd += f"hadd -k -f {self.output().basename} {input_files};"
+            self.cmd += f"rm {input_files};"
+        
+        self.cmd += f"mv {self.output().basename} {self.output().path}"
+        
+    def output(self):
+        return self.local_target(f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
     
     def run(self):
-        self.scan.run()
+        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        self.build_command()
+        self.run_cmd(self.cmd)
+
+class HaddPOIs(POITask):
+    def requires(self):
+        return ScanPOIs.req(self, branch=-1)
     
+    def output(self):
+        return self.local_target(f"scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+    
+    def run(self):
+        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        scan_collection = self.input()['collection']
+        assert isinstance(scan_collection, law.TargetCollection)
+        scan_target = scan_collection.first_target
+        assert isinstance(scan_target, law.LocalFileTarget)
+        input_files = os.path.join(scan_target.dirname,
+                                   f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.*.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        cmd = self.base_command
+        cmd += f"hadd -k -f {self.output().path} {input_files};"
+        self.run_cmd(cmd)
+        
+class PlotPOIs(POITask):
+    def requires(self):
+        return HaddPOIs.req(self)
+    
+    def output(self):
+        exts = ['png', 'pdf', 'root']
+        plots = [self.local_target(f"scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}.{ext}") for ext in exts]
+        return plots
+        
+    def run(self):
+        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        hadd_target = self.input()
+        assert isinstance(hadd_target, law.LocalFileTarget)
+        
+        if len(self.pois_split) == 1:
+            plotting_script = 'plot1DScan.py'
+            
+            # Configure plot optons
+            MAIN_OPTIONS_DICT = {
+                "observed":"--main-label \"Observed\" --main-color 1",
+                "postfit_asimov":"--main-label \"SM Expected (postfit)\" --main-color 2",
+                "prefit_asimov":"--main-label \"SM Expected (prefit)\" --main-color 4"
+            }
+            MAIN_OPTIONS = MAIN_OPTIONS_DICT[self.types]
+            plotting_options = (
+                f"--paper -o {self.output()[0].basename} --POI {self.pois} --model {self.model} "
+                f"--json {self.output()[0].dirname}/{self.types}_{self.pois}.json "
+                f"-m {hadd_target.path} --remin-main --remove-delta 1E-6 --improve --y-max 20 "
+                f"--chop 20 {MAIN_OPTIONS} --no-input-label --outdir {self.output()[0].dirname}"
+            )
+            
+        elif len(self.pois_split) == 2:
+            plotting_script = 'generic2D.py'
+            plotting_options = (
+                f"-o {self.output()[0].basename} -f {hadd_target.path} "
+                f"--remin --sm-point 0,0 --translate pois.json "
+                f"--x-axis {self.pois_split[0]} --y-axis {self.pois_split[1]}"
+            )
+        else:
+            raise ValueError(f"Cannot plot {len(self.pois_split)} (as >2) POIs")
+        
+        cmd = self.base_command
+        cmd += f"python3 {plotting_script} {plotting_options}"
+        self.run_cmd(cmd)
