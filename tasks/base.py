@@ -59,6 +59,7 @@ class ForceableTask(BaseTask):
             return BaseTask.complete(self)
 
 # Define a task that forces the outputs to be newer than the inputs
+# TODO make this traverse the entire tree, not just the level below
 class ForceNewerOutputTask(BaseTask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -100,7 +101,6 @@ class ForceNewerOutputTask(BaseTask):
         inputs_to_check = inputs_list.copy()
         for input in inputs_list:
             if input.optional:
-                print('removing optional input', input)
                 inputs_to_check.remove(input)
                 continue
             if not input.exists():

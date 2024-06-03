@@ -7,11 +7,16 @@
 # base tasks in analysis/framework.py.
 
 action() {
+    source /vols/grid/cms/setup.sh
     echo "Running CUDA setup"
     source /vols/software/cuda/setup.sh
     nvidia-smi
     echo "Running law setup"
-    source "{{analysis_path}}/setup.sh"
+    source "${ANALYSIS_PATH}/setup.sh" "--remote"
+    cwd=$(pwd)
+    cd "${CMSSW_PATH}"
+    cmsenv
+    cd "${cwd}"
     echo "Bootstrap done"
 }
 action

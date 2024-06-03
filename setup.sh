@@ -3,9 +3,19 @@
 # Define some colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
 action() {
+    # Check if --remote option is passed
+    local remote=false
+    for arg in "$@"; do
+        if [ "$arg" = "--remote" ]; then
+            remote=true
+            break
+        fi
+    done
+
     # Get current directories and shell information.
     local shell_is_zsh="$( [ -z "${ZSH_VERSION}" ] && echo "false" || echo "true" )"
     local this_file="$( ${shell_is_zsh} && echo "${(%):-%x}" || echo "${BASH_SOURCE[0]}" )"
@@ -31,16 +41,20 @@ action() {
     export DATA_PATH="${ANALYSIS_PATH}/data"
     export CMSSW_PATH="/home/hep/tr1123/CMSSW_14_0_0_pre0/src" # TODO get this from the user
 
-    # Setup EOS
-    echo -e "${GREEN}Getting kerberos ticket for EOS transfer...${NC}"
-    export EOS_PATH="/eos/user/t/trunting/www/HiggsFlow" # TODO get this from the user
-    # kinit to get a kerberos ticket, if one doesn't exist already
-    if ! klist | grep -q CERN.CH; then
-        echo -e "${RED}No kerberos ticket found. Running kinit to get a ticket.${NC}"
-        kinit -f trunting@CERN.CH # TODO get this from the user
-        echo -e "${GREEN}Got kerberos ticket.${NC}"
-    else
-        echo -e "${GREEN}Kerberos ticket found.${NC}"
+    # Setup EOS if not running on a remote machine
+    if [ "$remote" = false ]; then
+        export EOS_KERBEROS="trunting@CERN.CH" # TODO get this from the user
+        echo -e "${GREEN}Getting kerberos ticket for EOS transfer...${NC}"
+        export EOS_PATH="/eos/user/t/trunting/www/HiggsFlow" # TODO get this from the user
+        # kinit to get a kerberos ticket, if one doesn't exist already
+        if ! klist | grep -q CERN.CH; then
+            echo -e "${YELLOW}No kerberos ticket found. Running kinit to get a ticket.${NC}"
+            kinit -f "${EOS_KERBEROS}"
+            kswitch -p "${USER}" # Switch back to default principal
+            echo -e "${GREEN}Got kerberos ticket.${NC}"
+        else
+            echo -e "${GREEN}Kerberos ticket found.${NC}"
+        fi
     fi
 
     # Set up law completion
@@ -55,4 +69,4 @@ action() {
 
     echo -e "${GREEN}Analysis environment set up.${NC}"
 }
-action
+action "$@"
