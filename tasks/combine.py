@@ -1,6 +1,7 @@
 import os
 import re
 import law
+import law.decorator
 import luigi
 import shutil
 import numpy as np
@@ -9,6 +10,7 @@ from typing import Dict
 from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU
+from tasks.notify import NotifySlackParameterUTF8, SplitTimeDecorator
 
 from law.logger import get_logger
 logger = get_logger('luigi-interface')
@@ -66,7 +68,7 @@ class CombineBase(ForceableWithNewer):
         # Check if CMSSW_BASE is set, and source it if not
         self.cmssw_base = os.getenv("CMSSW_BASE")
         if self.cmssw_base is None:
-            raise ValueError("CMSSW_BASE is not set, please run 'cmsenv'")
+            raise ValueError("CMSSW_BASE is not set, please run 'cmsenv'. Make sure to reactivate this environment after.")
 
         # Check if combine is installed
         self.combine_path = shutil.which("combine")
@@ -431,18 +433,23 @@ class ScanSingles(POITask):
     """
     Takes a model and a number of points, performs a 1D profiled scan of each POI
     """
+    notify_slack = NotifySlackParameterUTF8()
+    split_timer = SplitTimeDecorator()
+    
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
         super().__init__(*args, **dict(kwargs, entire_model=True))
         
-    def requires(self):
+    @split_timer
+    def requires(self, *args, **kwargs):
         # Each branch requires the scan for the corresponding POI
         return {poi: PlotPOIs.req(self, pois=poi, n_points=self.n_points) for poi in self.pois_split}
     
     def output(self):
         return self.local_target(f"singles.txt")
     
+    @split_timer
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.pois_split}, will output {self.output()}")
         # Write to file
@@ -457,6 +464,9 @@ class ScanPairs(POITask):
     """
     Takes a model and a number of points, performs a 2D profiled scan of each pair of POIs
     """
+    notify_slack = NotifySlackParameterUTF8()
+    split_timer = SplitTimeDecorator()
+    
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
@@ -466,6 +476,7 @@ class ScanPairs(POITask):
         from itertools import combinations
         self.poi_pairs = list(map(','.join, list(combinations(self.pois_split, 2))))
         
+    @split_timer
     def requires(self):
         # Each branch requires the scan for the corresponding POI
         return {pair: PlotPOIs.req(self, pois=pair, n_points=self.n_points) for pair in self.poi_pairs}
@@ -473,6 +484,7 @@ class ScanPairs(POITask):
     def output(self):
         return self.local_target(f"pairs.txt")
     
+    @split_timer
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.poi_pairs}, will output {self.output()}")
         # Write to file
