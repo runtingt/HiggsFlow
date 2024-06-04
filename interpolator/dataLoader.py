@@ -33,6 +33,11 @@ def loadData(filename: str, POIs: List[str],
     # Clean up data
     df = df.drop_duplicates()
     df = df[df["deltaNLL"] < 9999] # NOTE: Clip large values
+    
+    # TODO handle this appropriately
+    if df["deltaNLL"].min() < 0:
+        raise ValueError("Negative deltaNLL values found")
+    
     if not include_best: df = df[df["deltaNLL"] != 0]
     df = df.reset_index()
     

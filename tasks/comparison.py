@@ -2,14 +2,19 @@ import law
 import luigi
 import models
 import json
+import uproot
+import pickle
+import pandas as pd
 import numpy as np
 import mplhep as hep
+from scipy.stats import norm
 from matplotlib import pyplot as plt
 from collections import defaultdict
 from tasks.base import ForceableWithNewer
-from tasks.interpolation import InterpolateSingles
+from tasks.interpolation import BuildInterpolator, InterpolateSingles
 from tasks.combine import ScanAll, ScanPairs, ScanSingles
 from tasks.utils import colors
+from interpolator.base import rbfInterpolator
 
 hep.style.use(hep.style.CMS)
 
@@ -32,9 +37,15 @@ class Compare(ForceableWithNewer):
         
     def requires(self):
         # TODO check models are compatible
+        # TODO refactor structure
         try:
             self.to_compare = {
-                f'interp_{model}' : InterpolateSingles(**models.models[model].to_params()) for model in self.models_to_compare
+                f'interp_{model}' : 
+                    {
+                        'singles' : InterpolateSingles(**models.models[model].to_params()),
+                        'interp' : BuildInterpolator(**models.models[model].to_params())
+                    } 
+                    for model in self.models_to_compare
                 }
             self.truth = {
                 'all' : ScanAll(**models.models[self.truth_model].to_params()), 
@@ -46,9 +57,13 @@ class Compare(ForceableWithNewer):
         return [self.to_compare, self.truth]
 
     def output(self):
-        return {
-            'fishbone' : self.local_target(f"fishbone_{models.models[self.truth_model].model}.png"),
-        }
+        try:
+            return {
+                'fishbone' : self.local_target(f"fishbone_{models.models[self.truth_model].model}.png"),
+                'diff1D' : self.local_target(f"diff1D_{models.models[self.truth_model].model}.png"),
+            }
+        except KeyError as e:
+            raise ValueError(f"Model key {e} not found in {models.__file__}")
         
     def process_limit(self, limit_json: law.LocalFileTarget, key: str):
         results = defaultdict(lambda: defaultdict(dict))
@@ -71,7 +86,7 @@ class Compare(ForceableWithNewer):
         truth_limits = self.input()[-1]['singles']['limits']
         interp_limits_dict = self.input()[0]
         assert isinstance(interp_limits_dict, dict)
-        interp_limits = list(interp_limits_dict.values())
+        interp_limits = [d['singles'] for d in interp_limits_dict.values()]
         limit_jsons = [truth_limits] + interp_limits
         results = defaultdict(lambda: defaultdict(dict))
         for limit_json, key in zip(limit_jsons, ['truth'] + list(interp_limits_dict.keys())):
@@ -126,9 +141,76 @@ class Compare(ForceableWithNewer):
         plt.tight_layout()
         plt.savefig(self.output()['fishbone'].path, dpi=125, bbox_inches='tight')
     
+    def make_diff1D(self):
+        # Get the truth likelihood values
+        scan = self.requires()[-1]['all']
+        assert isinstance(scan, ScanAll)
+        scan_target = scan.input()['all']
+        assert isinstance(scan_target, law.LocalFileTarget)
+        file = uproot.open(scan_target.path)
+        limit = file['limit']
+        scan_df = pd.DataFrame(limit.arrays(scan.COMBINE_POIS.split(',') + ['deltaNLL'], library='pd'))
+        file.close()
+        
+        # Process dataframe
+        scan_df.drop_duplicates(inplace=True)
+        scan_df['deltaq'] = 2*(scan_df['deltaNLL'])
+        mask = scan_df['deltaq'] < 10
+        
+        # For each model, load its 'Interpolator' object and compute values
+        # TODO better name?
+        interp_limits = self.input()[0]
+        assert isinstance(interp_limits, dict)
+        for key, model_req in interp_limits.items():
+            # Load the interpolator
+            interp = model_req['interp']
+            assert isinstance(interp, law.LocalFileTarget)
+            with open(interp.path, 'rb') as f:
+                interp = pickle.load(f)
+            assert isinstance(interp, rbfInterpolator)
+            
+            # Evaluate the interpolator at the scan points
+            model_out = np.full(len(scan_df), np.inf)
+            for i, pt in enumerate(scan_df[scan.COMBINE_POIS.split(',')].to_numpy()):
+                d = {k: [v] for k, v in zip(scan.COMBINE_POIS.split(','), pt)}
+                model_out[i] = 2*interp.evaluate(pd.DataFrame(d))[0]
+            scan_df[key] = model_out
+        
+        # Plot the difference to the test dataset in a histogram
+        fig, axs = plt.subplots(1, 2, figsize=(32, 9))
+        for i, key in enumerate(interp_limits.keys()):
+            error = scan_df["deltaq"][mask] - scan_df[key][mask]
+            
+            # Fit each distribution to a Gaussian
+            xs = np.linspace(-10, 6, 1000)
+            mu, std = norm.fit(error[~np.isnan(error)])
+            
+            # Plot each fit
+            for ax, nbins in zip(axs, [50, 200]):
+                assert isinstance(ax, plt.Axes)
+                ax.plot(xs, norm.pdf(xs, mu, std), 
+                        linestyle='--', c=colors[i+1], lw=2)
+                ax.hist(error, label=rf"{key}, $\mu={{{mu:.3f}}}, \sigma={{{std:.3f}}}$",
+                        range=(-10, 10), color=colors[i+1],
+                        bins=nbins, histtype='step', lw=2, density=True)
+            ax.set_xlim(-2, 1)
+
+        # Annotate
+        for ax in axs:
+            assert isinstance(ax, plt.Axes)
+            ax.text(1-0.0125, 0.925, r"$\Delta q < 10$", transform=ax.transAxes,
+                    ha="right", fontstyle='italic')
+            ax.legend(loc='upper left')
+            # ax.set_ylim(0, 5)
+            ax.set_xlabel(r"$True\;\Delta q - Model\;\Delta q$")
+            ax.set_ylabel("Density")
+        plt.tight_layout()
+        plt.savefig(self.output()['diff1D'].path, dpi=125, bbox_inches='tight')
+    
     def run(self):
         print("Comparing models:")
         for model in self.models_to_compare:
             print(f"  {model}")
         print(f"Against truth model: {self.truth_model}")
-        self.make_fishbone()
+        self.make_fishbone() # TODO check this still works
+        self.make_diff1D()
