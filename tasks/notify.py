@@ -25,7 +25,6 @@ class NotifySlackParameterUTF8(NotifyParameter):
 
     @staticmethod
     def notify(success, title, content, **kwargs):
-        print(success, title, content, kwargs)
         # escape the full content
         content = content.__class__(
             (k, v if isinstance(v, str) else v)
