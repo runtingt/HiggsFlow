@@ -19,6 +19,15 @@ def targetAsList(target: Union[Dict, List, Tuple, law.LocalFileTarget]) -> List[
     else:
         raise ValueError(f"Invalid target type: {type(target)}")
 
+def flatten(collection):
+    result = []
+    for i in collection:
+        if isinstance(i, Union[Dict, List, Tuple]):
+            result.extend(flatten(targetAsList(i)))
+        else:
+            result.append(i)
+    return result
+
 # Get the last modification time of a target
 def getTargetModificationTime(target: law.LocalFileTarget) -> float:
     return os.path.getmtime(target.path)
@@ -92,8 +101,8 @@ class ForceNewerOutputTask(BaseTask):
             else:
                 outputs_list_expanded.append(item)
         # Get a flat list of targets
-        inputs_list_expanded = [target for sublist in inputs_list_expanded for target in targetAsList(sublist)]
-        outputs_list_expanded = [target for sublist in outputs_list_expanded for target in targetAsList(sublist)]        
+        inputs_list_expanded = flatten([targetAsList(item.targets) if isinstance(item, law.TargetCollection) else item for item in inputs_list])
+        outputs_list_expanded = flatten([targetAsList(item.targets) if isinstance(item, law.TargetCollection) else item for item in outputs_list])       
         inputs_list = inputs_list_expanded
         outputs_list = outputs_list_expanded
 

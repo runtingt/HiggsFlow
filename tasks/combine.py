@@ -4,6 +4,7 @@ import law
 import law.decorator
 import luigi
 import shutil
+import json
 import numpy as np
 from io import TextIOWrapper
 from typing import Dict
@@ -11,6 +12,7 @@ from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRan
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU
 from tasks.notify import NotifySlackParameterUTF8, SplitTimeDecorator
+from tasks.utils import deep_merge
 
 from law.logger import get_logger
 logger = get_logger('luigi-interface')
@@ -237,24 +239,43 @@ class POITask(CombineBase):
         for poi in self.pois_split:
             assert poi in self.COMBINE_POIS.split(','), f"POI {poi} not in model POIs {self.COMBINE_POIS}"
     
-class GenerateRandom(CombineBase):
+class GenerateRandom(POITask):
     def __init__(self, *args, **kwargs):
-        self.pois = str(kwargs.pop("pois", "r")).split(',')
-        self.n_points = kwargs.pop("n_points", 10)
         super().__init__(*args, **kwargs)
-    
+        self.pois_split = self.pois.split(',')
+
     def output(self):
-        return self.local_target(f"random_points_{'_'.join(self.pois)}.txt")
+        targets = []
+        n_jobs = int(np.ceil(self.n_points / self.points_per_job))
+        start = 0
+        for i in range(n_jobs):
+            end = min(start + (self.points_per_job-1), self.n_points-1)
+            targets.append(self.local_target(f"random_points_{'_'.join(self.pois_split)}_{start}_{end}.txt"))
+            start += self.points_per_job
+        targets.append(self.local_target(f"random_points_{'_'.join(self.pois_split)}.txt"))
+        return targets
     
     def run(self):      
         # Generate random points in the bounds
-        points = np.random.uniform(self.bounds[:,0], self.bounds[:,1], 
-                                   (self.n_points, len(self.pois)))
+        poi_idxs = [self.COMBINE_POIS.split(',').index(poi) for poi in self.pois_split]
+        bounds = self.bounds[poi_idxs]
+        points = np.random.uniform(bounds[:, 0], bounds[:, 1], (self.n_points, len(self.pois_split)))
 
-        # Write to output as csv with pois as columns
-        with open(self.output().path, 'w') as f:
+        # Write to output to the correct files
+        for i, target in enumerate(self.output()[:-1]):
+            target = self.output()[i]
+            assert isinstance(target, law.LocalFileTarget)
+            with open(target.path, 'w') as f:
+                assert isinstance(f, TextIOWrapper)
+                f.write(self.pois + '\n')
+                for j in range(i*self.points_per_job, min((i+1)*self.points_per_job, self.n_points)):
+                    f.write(','.join(map(str, points[j])) + '\n')
+        
+        target = self.output()[-1]
+        assert isinstance(target, law.LocalFileTarget)
+        with open(target.path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
-            f.write(','.join(self.pois) + '\n')
+            f.write(self.pois + '\n')
             for point in points:
                 f.write(','.join(map(str, point)) + '\n')
 
@@ -282,6 +303,8 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
         super().__init__(*args, **kwargs)
         
         # Process arguments
+        self.start = self.branch * self.points_per_job
+        self.end = min(self.start + (self.points_per_job-1), self.n_points-1)
         self.scan_algos = {
             'grid': 'grid',
             'rand': 'fixed'
@@ -290,15 +313,13 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
         if self.algo is None:
             raise ValueError(f"Scan method {self.scan_method} not recognised")
         if self.scan_method == 'rand':
-            file_target = self.input()['file']
+            file_target = self.input()['file'][self.branch]
             assert isinstance(file_target, law.LocalFileTarget)
             self.file = file_target.path
         else:
             self.file = None
         self.FILE_STR = f"--fromfile {self.file}" if self.file is not None else ""
-        
-        self.start = self.branch * self.points_per_job
-        self.end = min(self.start + (self.points_per_job-1), self.n_points-1)
+        self.POINTS_STR = f"{self.end - self.start + 1}" if self.file is not None else "{self.n_points}"
         
         # Define the base command, handling only the branches, not the workflow itself
         if self.branch != -1:
@@ -333,14 +354,14 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
             f" -n .scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}"
             f" --snapshotName \"MultiDimFit\" --algo {self.algo} --saveInactivePOI 1"
             f" {self.SKIP_OPTIONS} {self.COMBINE_SET_OPTIONS}"
-            f" --points {self.n_points} --alignEdges 1 {self.POIS_TO_RUN}"
+            f" --points {self.POINTS_STR} --alignEdges 1 {self.POIS_TO_RUN}"
             f" --firstPoint {self.start} --lastPoint {self.end}"
-            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}_local.log;"
+            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}_local.{self.branch}.log;"
         )
         
         if self.file is not None:
             input_files = ""
-            for i in range(self.start, self.end + 1):
+            for i in range(self.end - self.start + 1):
                 input_files += os.path.join(os.getenv('ANALYSIS_PATH'), 
                                             f'higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.POINTS.{i}.{i}.MultiDimFit.mH125.38.root ')
             self.cmd += f"hadd -k -f {self.output().basename} {input_files};"
@@ -382,6 +403,8 @@ class PlotPOIs(POITask):
     def output(self):
         exts = ['png', 'pdf', 'root']
         plots = [self.local_target(f"scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}.{ext}") for ext in exts]
+        if len(self.pois_split) == 1:
+            plots.append(self.local_target(f"{self.types}_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}.json"))
         return plots
         
     def run(self):
@@ -401,7 +424,7 @@ class PlotPOIs(POITask):
             MAIN_OPTIONS = MAIN_OPTIONS_DICT[self.types]
             plotting_options = (
                 f"--paper -o {os.path.splitext(self.output()[0].basename)[0]} --POI {self.pois} --model {self.model} "
-                f"--json {self.output()[0].dirname}/{self.types}_{self.pois}.json "
+                f"--json {self.output()[-1].path} "
                 f"-m {hadd_target.path} --remin-main --remove-delta 1E-6 --improve --y-max 20 "
                 f"--chop 20 {MAIN_OPTIONS} --no-input-label --outdir {self.output()[0].dirname}"
             )
@@ -448,18 +471,32 @@ class ScanSingles(POITask):
         return {poi: PlotPOIs.req(self, pois=poi, n_points=self.n_points) for poi in self.pois_split}
     
     def output(self):
-        return self.local_target(f"singles.txt")
-    
+        return {
+            'log' : self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt"),
+            'limits' : self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.json")
+        }
+        
     @split_timer
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.pois_split}, will output {self.output()}")
-        # Write to file
-        with open(self.output().path, 'w') as f:
+        # Log to file
+        with open(self.output()['log'].path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
             for poi in self.pois_split:
                 scan_target = self.input()[poi][0]
                 assert isinstance(scan_target, law.LocalFileTarget)
                 f.write(f"{poi} {scan_target.path}\n")
+                
+        # Grab and merge the jsons
+        jsons = [self.input()[poi][-1] for poi in self.pois_split]
+        merged_data = {}
+        for file in jsons:
+            assert isinstance(file, law.LocalFileTarget)
+            with open(file.path, 'r') as f:
+                data = json.load(f)
+                deep_merge(merged_data, data)
+        with open(self.output()['limits'].path, 'w') as f:
+            json.dump(merged_data, f, indent=4)
 
 class ScanPairs(POITask):
     """
@@ -483,7 +520,7 @@ class ScanPairs(POITask):
         return {pair: PlotPOIs.req(self, pois=pair, n_points=self.n_points) for pair in self.poi_pairs}
     
     def output(self):
-        return self.local_target(f"pairs.txt")
+        return self.local_target(f"pairs.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt")
     
     @split_timer
     def run(self):
@@ -514,7 +551,7 @@ class ScanAll(POITask):
         return {'all': HaddPOIs.req(self, pois=self.COMBINE_POIS, n_points=self.n_points)}
     
     def output(self):
-        return self.local_target(f"all.txt")
+        return self.local_target(f"all.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt")
     
     @split_timer
     def run(self):
