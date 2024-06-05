@@ -9,6 +9,7 @@ import numpy as np
 from io import TextIOWrapper
 from typing import Dict
 from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList
+from itertools import combinations
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU
 from tasks.notify import NotifySlackParameterUTF8, SplitTimeDecorator
@@ -224,6 +225,11 @@ class POITask(CombineBase):
         description="number of points to run per job; default is 2"
     )
     
+    is_all = luigi.BoolParameter(
+        default=False,
+        description="run all POIs simultaneously; default is False"
+    )
+    
     def __init__(self, *args, **kwargs):
         entire_model = kwargs.pop("entire_model", False)
         super().__init__(*args, **kwargs)
@@ -234,8 +240,11 @@ class POITask(CombineBase):
             self.pois = self.COMBINE_POIS
         else:
             self.pois_split = str(self.pois).split(',')
+        if self.is_all:
+            self.POI_NAME_STR = "all"
+        else:
+            self.POI_NAME_STR = "_".join(self.pois_split)
         self.POIS_TO_RUN = " ".join([f"-P {poi}" for poi in self.pois_split])
-        self.POI_NAME_STR = "_".join(self.pois_split)
         for poi in self.pois_split:
             assert poi in self.COMBINE_POIS.split(','), f"POI {poi} not in model POIs {self.COMBINE_POIS}"
     
@@ -319,7 +328,7 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
         else:
             self.file = None
         self.FILE_STR = f"--fromfile {self.file}" if self.file is not None else ""
-        self.POINTS_STR = f"{self.end - self.start + 1}" if self.file is not None else "{self.n_points}"
+        self.POINTS_STR = f"{self.end - self.start + 1}" if self.file is not None else f"{self.n_points}"
         
         # Define the base command, handling only the branches, not the workflow itself
         if self.branch != -1:
@@ -511,7 +520,7 @@ class ScanPairs(POITask):
         super().__init__(*args, **dict(kwargs, entire_model=True))
         
         # Compute pairs
-        from itertools import combinations
+        # TODO test a model with only one POI
         self.poi_pairs = list(map(','.join, list(combinations(self.pois_split, 2))))
         
     @split_timer
@@ -543,13 +552,13 @@ class ScanAll(POITask):
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
-        super().__init__(*args, **dict(kwargs, entire_model=True))
+        super().__init__(*args, **dict(kwargs, entire_model=True, is_all=True))
     
     @split_timer  
     def requires(self):
         # Each branch requires the scan for the corresponding POI
-        return {'all': HaddPOIs.req(self, pois=self.COMBINE_POIS, n_points=self.n_points)}
-    
+        return {'all': HaddPOIs.req(self, pois=self.COMBINE_POIS, n_points=self.n_points, is_all=True)}
+
     def output(self):
         return self.local_target(f"all.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt")
     
