@@ -13,10 +13,11 @@ action() {
     nvidia-smi
     echo "Running law setup"
     source "${ANALYSIS_PATH}/setup.sh" "--remote"
-    cwd=$(pwd)
-    cd "${CMSSW_PATH}"
-    cmsenv
-    cd "${cwd}"
+    # cwd=$(pwd)
+    # cd "${CMSSW_PATH}"
+    # cmsenv
+    # cd "${cwd}"
+    which law
     echo "Bootstrap done"
 }
 action
