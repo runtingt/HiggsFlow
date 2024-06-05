@@ -8,7 +8,7 @@ import json
 import numpy as np
 from io import TextIOWrapper
 from typing import Dict
-from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList
+from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList, SetSMVals
 from itertools import combinations
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU
@@ -91,6 +91,7 @@ class CombineBase(ForceableWithNewer):
         
         # Parse the model
         self.COMBINE_OPTIONS = GetMinimizerOpts(self.model)
+        self.COMBINE_SET = SetSMVals(self.model)
         self.COMBINE_SET_OPTIONS = ""
         self.COMBINE_POIS = GetPOIsList(self.model)
         # self.COMBINE_POIS_TO_RUN = GetGeneratePOIs(self.model)
@@ -103,8 +104,8 @@ class CombineBase(ForceableWithNewer):
         bound_strs = self.COMBINE_RANGES.split(':')
         bounds = []
         for poi, bound_str in zip(self.COMBINE_POIS.split(','), bound_strs):
-            assert poi in bound_str, f"{self.pois} does not match {bound_strs}"
-            lo, hi = map(float, bound_str.strip(poi+'=').split(','))
+            assert poi in bound_str, f"{poi} does not match {bound_strs}"
+            lo, hi = map(float, bound_str.split('=')[1].split(','))
             bounds.append(np.array([lo, hi]))
         self.bounds = np.array(bounds)
         
@@ -171,7 +172,7 @@ class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):
         return [None] # Single branch, no special data
     
     def workflow_requires(self):
-        return []
+        return {'wsp': TextToWorkspace.req(self)}
     
     def requires(self):
         return TextToWorkspace.req(self)
@@ -188,8 +189,8 @@ class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):
         if 'observed' in self.types: GENERATE_STR += ";observed,!,!"
         if 'prefit_asimov' in self.types: GENERATE_STR += ";prefit_asimov,-1,!"
         if 'postfit_asimov' in self.types: GENERATE_STR += ";postfit_asimov,-1, "
-        input = self.input()
-        assert isinstance(input, law.LocalFileTarget)
+        input = self.input()['workspace']
+        assert isinstance(input, law.LocalFileTarget), f"Expected LocalFileTarget, got {input, type(input)}"
         ws_path = input.path
 
         # Build and run the command
@@ -205,6 +206,42 @@ class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):
         )
         cmd += f"mv {self.output()['tree'].basename} {self.output()['tree'].path};"
         self.run_cmd(cmd)
+        
+class Impacts(CombineBase, HTCondorCPU, law.LocalWorkflow):
+    def create_branch_map(self):
+        return [None] # Single branch, no special data
+    
+    def workflow_requires(self):
+        return {'init' : InitialFit.req(self)}
+    
+    def requires(self):
+        return InitialFit.req(self)
+    
+    def output(self):
+        return self.local_target(f"higgsCombine.robustHesse.{self.channel}.{self.model}.{self.types}.root")
+    
+    def run(self):
+        initial_target = self.input()['tree']
+        assert isinstance(initial_target, law.LocalFileTarget)
+        initial_path = initial_target.path
+        dataset = "toys/toy_asimov"
+        if self.types == "observed":
+            dataset = "data_obs"
+        cmd = self.base_command
+        # TODO include rgx{prop.*} in the freeze list (this breaks hgg_statonly atm)
+        cmd += (
+            f"{self.time_command} combineTool.py -M MultiDimFit "
+            f"-m {self.MH} -d {initial_path} "
+            f"--redefineSignalPOIs {self.COMBINE_POIS} "
+            f"--saveInactivePOI 1 --snapshotName MultiDimFit "
+            f"--freezeParameters MH{self.COMBINE_FREEZE} "
+            f"-D {dataset} {self.COMBINE_OPTIONS} --robustHesse 1 --robustFit 1 "
+            f"--robustHesseSave hessian_{self.channel}_{self.model}.{self.types}.root "
+            f"-n .robustHesse.{self.channel}.{self.model}.{self.types} -v 3 "
+            f"&> {self.output().dirname}/impacts_{self.channel}_{self.model}_{self.types}_local.log;"
+            )
+        cmd += f"mv {self.output().basename} {self.output().path};"
+        self.run_cmd(cmd)            
 
 class POITask(CombineBase):
     """
