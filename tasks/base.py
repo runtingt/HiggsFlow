@@ -55,7 +55,7 @@ class ForceableTask(BaseTask):
             logger.debug(f"Forcing task {self.__class__.__name__} to run")
             return False
         else:
-            return BaseTask.complete(self) 
+            return BaseTask.complete(self)
 
 # Define a task that forces the outputs to be newer than the inputs
 class ForceNewerOutputTask(BaseTask):
@@ -75,8 +75,6 @@ class ForceNewerOutputTask(BaseTask):
         # Get targets as lists
         inputs_list = targetAsList(inputs)
         outputs_list = targetAsList(outputs)
-        print(inputs_list)
-        print(outputs_list)
 
         # Check if files exist
         for input in inputs_list:
