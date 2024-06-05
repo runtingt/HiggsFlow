@@ -49,6 +49,7 @@ class ForceableTask(BaseTask):
     
     def run(self): # NOTE: This must be called by the derived class
         self.has_run = True
+        print('ForceableTask run method was called')
     
     def complete(self):
         if self.force and not self.has_run:
@@ -75,23 +76,53 @@ class ForceNewerOutputTask(BaseTask):
         # Get targets as lists
         inputs_list = targetAsList(inputs)
         outputs_list = targetAsList(outputs)
+        
+        # Expand any target collections
+        inputs_list_expanded = []
+        outputs_list_expanded = []
+        for item in inputs_list:
+            if isinstance(item, law.TargetCollection):
+                inputs_list_expanded.append(item.targets)
+            else:
+                inputs_list_expanded.append(item)
+        for item in outputs_list:
+            if isinstance(item, law.TargetCollection):
+                outputs_list_expanded.append(item.targets)
+            else:
+                outputs_list_expanded.append(item)
+        # Get a flat list of targets
+        inputs_list_expanded = [target for sublist in inputs_list_expanded for target in targetAsList(sublist)]
+        outputs_list_expanded = [target for sublist in outputs_list_expanded for target in targetAsList(sublist)]        
+        inputs_list = inputs_list_expanded
+        outputs_list = outputs_list_expanded
 
         # Check if files exist
+        inputs_to_check = inputs_list.copy()
         for input in inputs_list:
+            if input.optional:
+                print('removing optional input', input)
+                inputs_to_check.remove(input)
+                continue
             if not input.exists():
                 logger.debug(f"Task {self.__class__.__name__} is missing input {input}")
                 return False # When the now-missing input is created, it will be newer than the outputs
+        outputs_to_check = outputs_list.copy()
         for output in outputs_list:
-            if not output.exists():
+            if output.optional:
+                outputs_to_check.remove(output)
+                continue
+            if not output.exists() and output.optional == False:
                 logger.debug(f"Task {self.__class__.__name__} is missing output {output}")
                 return False
             
         # The task is complete if all outputs are newer than all inputs
-        input_times = [getTargetModificationTime(input) for input in inputs_list]
+        input_times = [getTargetModificationTime(input) for input in inputs_to_check]
+        if len(input_times) == 0:
+            return BaseTask.complete(self) 
         newest_idx = np.argmax(input_times)
         newest_input = inputs_list[newest_idx]
         newest_input_time = input_times[newest_idx]
-        output_times = [getTargetModificationTime(output) for output in outputs_list]
+        output_times = [getTargetModificationTime(output) for output in outputs_to_check]
         oldest_idx = np.argmin(output_times)
         oldest_output = outputs_list[oldest_idx]
         oldest_output_time = output_times[oldest_idx]
