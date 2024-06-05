@@ -251,3 +251,7 @@ class rbfInterpolator(Interpolator):
                        options={'maxls':20, 'disp':-1})
         
         return res
+
+# TODO add an interpolator for SMEFT (needs impacts but for the STXSStage1p2XSBRRefHggStatOnly model)
+# TODO add an interpolator for STXS (needs impacts)
+# TODO define these models (and that they need impacts) in the models dict
