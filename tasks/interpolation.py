@@ -2,10 +2,12 @@ import law
 import pickle
 import numpy as np
 import json
+from io import TextIOWrapper
+from itertools import combinations
 from tasks.combine import CombineBase, POITask, ScanAll
 from interpolator.base import rbfInterpolator
 from interpolator.utils import Data
-from interpolator.profiler import profile1D
+from interpolator.profiler import profile1D, profile2D
 from law.logger import get_logger
 logger = get_logger('luigi-interface')
 
@@ -47,6 +49,8 @@ class BuildInterpolator(CombineBase):
             pickle.dump(interp, f)
         logger.info(f"Interpolator built")
 
+# TODO merge single and pair?
+# TODO base interpolator task?
 class InterpolateSingle(POITask):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,7 +61,10 @@ class InterpolateSingle(POITask):
         return BuildInterpolator.req(self)
 
     def output(self):
-        return self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{self.poi}.json")
+        return {
+            'limits' : self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{self.poi}.json"),
+            'profile' : self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{self.poi}.npy")
+        }
     
     def run(self):    
         # Load the interpolator
@@ -72,6 +79,9 @@ class InterpolateSingle(POITask):
         # Re-minimise the results
         x_vals = res[self.poi]
         y_vals = 2*(res['deltaNLL'] - res['best'])
+        
+        # Save the profile
+        np.save(self.output()['profile'].path, np.array([x_vals, y_vals]))
         
         # Fit the profiled points
         fit = np.polyfit(x_vals, y_vals, 20)
@@ -97,9 +107,41 @@ class InterpolateSingle(POITask):
         results_dict[self.model][self.poi]['ErrorHi'] = max(err_1sig)
         results_dict[self.model][self.poi]['ErrorLo'] = min(err_1sig)
         results_dict[self.model][self.poi]['Val'] = res['best_x']
-        with open(self.output().path, 'w') as f:
+        with open(self.output()['limits'].path, 'w') as f:
             json.dump(results_dict, f, indent=4)
+
+class InterpolatePair(POITask):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert len(self.pois_split) == 2, f"InterpolatePair only supports pairs of POIs, not {self.pois_split}"
+        self.pair = self.pois_split
+    
+    def requires(self):
+        return BuildInterpolator.req(self)
+
+    def output(self):
+        return {
+            'profile' : self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{self.pair}.npy")
+        }
+    
+    def run(self):    
+        # Load the interpolator
+        interp = self.input()
+        assert isinstance(interp, law.LocalFileTarget)
+        with open(interp.path, 'rb') as f:
+            interp = pickle.load(f)
         
+        # Profile the interpolator
+        res = profile2D(interp, self.pair, num=100) # TODO parametrise
+        
+        # Re-minimise the results
+        x_vals = res[self.pair[0]]
+        y_vals = res[self.pair[1]]
+        z_vals = 2*(res['deltaNLL'] - res['best'])
+
+        # Save the profile
+        np.save(self.output()['profile'].path, np.array([x_vals, y_vals, z_vals]))
+
 class InterpolateSingles(POITask):
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
@@ -107,14 +149,14 @@ class InterpolateSingles(POITask):
         super().__init__(*args, **dict(kwargs, entire_model=True))
     
     def requires(self):
-        return [InterpolateSingle.req(self, pois=poi) for poi in self.pois_split]
+        return {poi: InterpolateSingle.req(self, pois=poi) for poi in self.pois_split}
     
     def output(self):
         return self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.json")
     
     def run(self):
         # Merge the results
-        results = {poi: self.input()[i] for i, poi in enumerate(self.pois_split)}
+        results = {poi: self.input()[poi]['limits'] for poi in self.pois_split}
         results_dict = {self.model: {}}
         for poi, result in results.items():
             assert isinstance(result, law.LocalFileTarget)
@@ -122,3 +164,24 @@ class InterpolateSingles(POITask):
                 results_dict[self.model][poi] = json.load(f)[self.model][poi]
         with open(self.output().path, 'w') as f:
             json.dump(results_dict, f, indent=4)
+
+class InterpolatePairs(POITask):
+    def __init__(self, *args, **kwargs):
+        # Just pass in the model's pois
+        # TODO can we do this in a cleaner way?
+        super().__init__(*args, **dict(kwargs, entire_model=True))
+        
+        # Compute pairs
+        self.poi_pairs = list(map(','.join, list(combinations(self.pois_split, 2))))
+    
+    def output(self):
+        return self.local_target(f"pairs.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt")
+    
+    def requires(self):
+        return {pair: InterpolatePair.req(self, pois=pair) for pair in self.poi_pairs}
+    
+    def run(self):
+        # Write to log
+        with open(self.output().path, 'w') as f:
+            assert isinstance(f, TextIOWrapper)
+            f.write('\n'.join(self.poi_pairs))

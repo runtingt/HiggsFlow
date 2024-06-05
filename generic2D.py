@@ -238,7 +238,10 @@ for scan in order:
             c.SetLineStyle(7)
             pads[0].cd()
             outfile.WriteTObject(c, 'graph95_%s_%i' % (scan, i))
-    legend.AddEntry(conts68[scan][0], 'Scan', 'F')
+    try:
+      legend.AddEntry(conts68[scan][0], 'Scan', 'F')
+    except IndexError:
+      print(f"Warning: no 68% CL contour found to add to legend for scan {scan}")
 for scan in order:
     for i, c in enumerate(conts68[scan]):
         c.Draw('L SAME')
@@ -273,8 +276,11 @@ if (args.layout==1):
 if (args.layout==2):
   legend2 = ROOT.TLegend(0.6, 0.7, 0.9, 0.9, '', 'NBNDC')
   legend2.SetNColumns(2)
-legend2.AddEntry(conts68['default'][0], '1#sigma region', 'F')
-legend2.AddEntry(conts95['default'][0], '2#sigma region', 'L')
+try:
+  legend2.AddEntry(conts68['default'][0], '1#sigma region', 'F')
+  legend2.AddEntry(conts95['default'][0], '2#sigma region', 'L')
+except IndexError:
+  print(f"Warning: Missing at least one CL contour to add to legend2")
 legend2.AddEntry(bestfits['default'], 'Best fit', 'P')
 legend2.AddEntry(sm_point, 'SM expected', 'P')
 legend2.SetMargin(0.4)

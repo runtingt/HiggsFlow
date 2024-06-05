@@ -9,10 +9,11 @@ import numpy as np
 import mplhep as hep
 from scipy.stats import norm
 from matplotlib import pyplot as plt
+from matplotlib.gridspec import GridSpec
 from collections import defaultdict
 from tasks.base import ForceableWithNewer
-from tasks.interpolation import BuildInterpolator, InterpolateSingles
-from tasks.combine import ScanAll, ScanPairs, ScanSingles
+from tasks.interpolation import BuildInterpolator, InterpolateSingles, InterpolatePairs
+from tasks.combine import PlotPOIs, ScanAll, ScanPairs, ScanSingles
 from tasks.utils import colors
 from interpolator.base import rbfInterpolator
 
@@ -37,12 +38,12 @@ class Compare(ForceableWithNewer):
         
     def requires(self):
         # TODO check models are compatible
-        # TODO refactor structure
         try:
             self.to_compare = {
                 f'interp_{model}' : 
                     {
                         'singles' : InterpolateSingles(**models.models[model].to_params()),
+                        'pairs' : InterpolatePairs(**models.models[model].to_params()),
                         'interp' : BuildInterpolator(**models.models[model].to_params())
                     } 
                     for model in self.models_to_compare
@@ -61,6 +62,7 @@ class Compare(ForceableWithNewer):
             return {
                 'fishbone' : self.local_target(f"fishbone_{models.models[self.truth_model].model}.png"),
                 'diff1D' : self.local_target(f"diff1D_{models.models[self.truth_model].model}.png"),
+                'corner' : self.local_target(f"corner_{models.models[self.truth_model].model}.png"),
             }
         except KeyError as e:
             raise ValueError(f"Model key {e} not found in {models.__file__}")
@@ -96,7 +98,6 @@ class Compare(ForceableWithNewer):
         # Plot
         pois = list(results['truth'].keys())
         fig, ax = plt.subplots(1, 1, figsize=(16, 9))
-        cmap = [0, 2, 1]
         assert isinstance(ax, plt.Axes)
         xs = np.arange(len(pois))
         levels = [1, 4]
@@ -112,16 +113,16 @@ class Compare(ForceableWithNewer):
         for i, (model, shift) in enumerate(zip(results.keys(), shifts)):
             # Extract the best fits
             best_fits = [results[model][poi]['best'] for poi in pois]
-            ax.scatter(xs+shift, best_fits, s=100, zorder=2, c=colors[cmap[i]])
+            ax.scatter(xs+shift, best_fits, s=100, zorder=2, c=colors[i])
             
             # Extract the CIs
             for j in range(len(levels)):
                 ci = np.array([results[model][poi][f'ci_{j}'] for poi in pois]).T
-                ax.plot([xs+shift, xs+shift], ci, c=colors[cmap[i]], 
+                ax.plot([xs+shift, xs+shift], ci, c=colors[i], 
                         lw=5-2*j, ls=ci_styles[j])
             
             # For a nice legend
-            ax.plot(0, lw=10, label=model, c=colors[cmap[i]])
+            ax.plot(0, lw=10, label=model, c=colors[i])
             
         # Add to legend
         ax.scatter(np.inf, np.inf, s=0,  c='k', label='\n')
@@ -207,10 +208,142 @@ class Compare(ForceableWithNewer):
         plt.tight_layout()
         plt.savefig(self.output()['diff1D'].path, dpi=125, bbox_inches='tight')
     
+    def make_corner(self):
+        truth_singles = self.requires()[-1]['singles']
+        truth_pairs = self.requires()[-1]['pairs']
+        assert isinstance(truth_singles, ScanSingles)
+        assert isinstance(truth_pairs, ScanPairs)
+        pois = truth_singles.COMBINE_POIS.split(',')
+        
+        # Plot
+        fig = plt.figure(figsize=(45, 30))
+        gs = GridSpec(len(pois), len(pois), hspace=0., wspace=0.)
+        for i in range(len(pois)):
+            for j in range(len(pois)):
+                ax = fig.add_subplot(gs[i*len(pois) + j])
+                # Upper right triangle is disabled
+                if j > i:
+                    ax.axis('off')
+                    # Add legend
+                    if i == 0 and j == len(pois)-1:
+                        ax.plot(np.inf, np.inf, lw=5, label='truth', c=colors[0])
+                        for k, label in enumerate(self.to_compare.keys()):
+                            ax.plot(np.inf, np.inf, lw=5, label=label, c=colors[k+1])
+                        ax.legend(loc='upper right', handlelength=2, prop={'size': 54})
+                        
+                # Plot 1D
+                elif j == i:              
+                    # Plot truth
+                    target_plot = truth_singles.requires()[pois[i]]
+                    assert isinstance(target_plot, PlotPOIs)
+                    target_scan = target_plot.input()
+                    assert isinstance(target_scan, law.LocalFileTarget)
+                    file = uproot.open(target_scan.path)
+                    limit = file['limit']
+                    scan_df = pd.DataFrame(limit.arrays(library='pd'))
+                    file.close()
+                    
+                    # Fit deltaNLL to a polynomial
+                    scan_df.drop_duplicates(inplace=True)
+                    mask = 2*scan_df['deltaNLL'] < 10
+                    x = scan_df[pois[i]][mask]
+                    y = scan_df['deltaNLL'][mask]
+                    p = np.polyfit(x, y, 4)
+                    x_fit = np.linspace(x.min(), x.max(), 1000)
+                    y_fit = np.polyval(p, x_fit)
+                    mask = 2*y_fit < 10
+                    
+                    # Plot
+                    ax.plot(x_fit[mask], 2*y_fit[mask], c=colors[0], lw=5)
+                    ax.scatter(scan_df[pois[i]], 2*scan_df['deltaNLL'], c=colors[0], s=100)
+                    
+                    # Plot models
+                    for k, model in enumerate(self.to_compare.keys()):
+                        # Load the interpolator
+                        interp = self.to_compare[model]['singles']
+                        assert isinstance(interp, InterpolateSingles)
+                        target = interp.input()[pois[i]]['profile']
+                        assert isinstance(target, law.LocalFileTarget)
+                        profile = np.load(target.path)
+                        mask = profile[1] < 10
+                        ax.plot(profile[0][mask], profile[1][mask], c=colors[k+1], lw=5)
+                        
+                    # Annotate
+                    ax.set_ylim((0, 12))
+                    ax.set_xlim(truth_singles.bounds[i][0]*1.05, truth_singles.bounds[i][1]*1.05)
+                    shifts = [1.00, 4.00]
+                    shiftlabels = ['68%', '95%']
+                    for shift, label in zip(shifts, shiftlabels):
+                        # Add horizontal lines
+                        ax.plot([np.min(x)*2, np.max(x)*2], [shift, shift], 
+                                lw=2.5, ls='-', c='k', alpha=0.1, zorder=-5)
+                        ax.text(0.995, (shift+0.15)/ax.get_ylim()[1], 
+                                f'{label}', transform=ax.transAxes,
+                                horizontalalignment='right', 
+                                fontsize=48, alpha=0.75)
+                        ax.text(0.01, 0.975, r"$\Delta NLL$",
+                                transform=ax.transAxes, horizontalalignment='left',
+                                verticalalignment='top', fontweight='regular',
+                                fontsize=54, alpha=0.4)
+                    
+                # Plot 2D
+                else:
+                    # Plot truth
+                    contours = {}
+                    pair = f"{pois[j]},{pois[i]}"
+                    target_plot = truth_pairs.input()[pair][2]
+                    assert isinstance(target_plot, law.LocalFileTarget)
+                    file = uproot.open(target_plot.path)
+                    cis = [68, 95]
+                    for ci in cis: 
+                        try:
+                            contours[ci] = file[f'graph{ci}_default_0;1'].values()
+                        except uproot.KeyInFileError:
+                            print(f"Warning: no {ci}% CL contour found to add")
+                    file.close()
+                    
+                    for ci, ls in zip(cis, ['-', '--']):
+                        try:
+                            ax.plot(contours[ci][0], contours[ci][1], c=colors[0], lw=5, ls=ls)
+                        except KeyError:
+                            print(f"Warning: no {ci}% CL contour found to plot")
+                    
+                    # Plot models
+                    for k, model in enumerate(self.to_compare.keys()):
+                        # Load the interpolator
+                        interp = self.to_compare[model]['pairs']
+                        assert isinstance(interp, InterpolatePairs)
+                        target = interp.input()[pair]['profile']
+                        assert isinstance(target, law.LocalFileTarget)
+                        profile = np.load(target.path)
+                        
+                        shifts = [2.30, 6.18]
+                        for shift, style in zip(shifts, ['-', '--']):
+                            ax.contour(profile[0], profile[1], profile[2], 
+                                       levels=[shift], colors=colors[k+1], 
+                                       linestyles=style, linewidths=5)
+                            
+                    ax.set_xlim(truth_singles.bounds[j][0]*1.05, truth_singles.bounds[j][1]*1.05)
+                    ax.set_ylim(truth_singles.bounds[i][0]*1.05, truth_singles.bounds[i][1]*1.05)
+                
+                # Label
+                if j == 0 and i != 0:
+                    ax.set_ylabel(pois[i], fontsize=48)
+                else:
+                    ax.tick_params(labelleft=False)
+                if i == len(pois)-1:
+                    ax.set_xlabel(pois[j], fontsize=48)
+                else:
+                    ax.tick_params(labelbottom=False)
+                ax.tick_params(labelsize=40)
+
+        plt.savefig(self.output()['corner'].path, bbox_inches='tight', dpi=125)
+    
     def run(self):
         print("Comparing models:")
         for model in self.models_to_compare:
             print(f"  {model}")
         print(f"Against truth model: {self.truth_model}")
-        self.make_fishbone() # TODO check this still works
+        self.make_fishbone()
         self.make_diff1D()
+        self.make_corner()
