@@ -124,8 +124,8 @@ getPOIs = {
 
     "STXStoSMEFTExpandedLinearStatOnly": {
      "POIs" : {
-          "lchgXE3" : {"range": [-35.,30.]  , "points":20, "SMVal": 0.},
-          "lchwXE2" : {"range": [-5.,7.]  , "points":20, "SMVal": 0.},
+          "lchgXE3" : {"range": [-25.,10.]  , "points":20, "SMVal": 0.},
+          "lchwXE2" : {"range": [-5.,3.]  , "points":20, "SMVal": 0.},
      },
      "POIsFix" : {},
      "UseWsp": "STXStoSMEFTExpanded",
