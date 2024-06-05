@@ -1,0 +1,8 @@
+.law/
+__pycache__/
+
+# Ignore everything in the data directory
+data/*
+
+# Don't ignore the TestInputs directory
+!data/TestInputs/
