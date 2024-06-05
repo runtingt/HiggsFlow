@@ -57,6 +57,11 @@ class CombineBase(ForceableWithNewer):
         description="attributes of the scan to run; default is nominal"
     )
     
+    scan_method = luigi.Parameter(
+        default="grid",
+        description="scan method to use; default is grid"
+    )
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
@@ -90,6 +95,15 @@ class CombineBase(ForceableWithNewer):
         self.COMBINE_FREEZE = GetFreezeList(self.model)
         if self.COMBINE_FREEZE != '':
             self.COMBINE_FREEZE = ',' + self.COMBINE_FREEZE
+            
+        # Get poi bounds
+        bound_strs = self.COMBINE_RANGES.split(':')
+        bounds = []
+        for poi, bound_str in zip(self.COMBINE_POIS.split(','), bound_strs):
+            assert poi in bound_str, f"{self.pois} does not match {bound_strs}"
+            lo, hi = map(float, bound_str.strip(poi+'=').split(','))
+            bounds.append(np.array([lo, hi]))
+        self.bounds = np.array(bounds)
         
     def run_cmd(self, cmd: str) -> None:
         logger.info(f"Running command: {cmd}")
@@ -207,11 +221,6 @@ class POITask(CombineBase):
         default=2,
         description="number of points to run per job; default is 2"
     )
-
-    scan_method = luigi.Parameter(
-        default="grid",
-        description="scan method to use; default is grid"
-    )
     
     def __init__(self, *args, **kwargs):
         entire_model = kwargs.pop("entire_model", False)
@@ -237,18 +246,10 @@ class GenerateRandom(CombineBase):
     def output(self):
         return self.local_target(f"random_points_{'_'.join(self.pois)}.txt")
     
-    def run(self):
-        # Get poi bounds
-        bound_strs = self.COMBINE_RANGES.split(':')
-        bounds = []
-        for poi, bound_str in zip(self.pois, bound_strs):
-            assert poi in bound_str, f"{self.pois} does not match {bound_strs}"
-            lo, hi = map(float, bound_str.strip(poi+'=').split(','))
-            bounds.append(np.array([lo, hi]))
-        bounds = np.array(bounds)
-        
+    def run(self):      
         # Generate random points in the bounds
-        points = np.random.uniform(bounds[:,0], bounds[:,1], (self.n_points, len(self.pois)))
+        points = np.random.uniform(self.bounds[:,0], self.bounds[:,1], 
+                                   (self.n_points, len(self.pois)))
 
         # Write to output as csv with pois as columns
         with open(self.output().path, 'w') as f:
@@ -499,23 +500,28 @@ class ScanAll(POITask):
     """
     Take a model and a number of points, perform a scan of all POIs simultaneously
     """
+    notify_slack = NotifySlackParameterUTF8()
+    split_timer = SplitTimeDecorator()
+    
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
         super().__init__(*args, **dict(kwargs, entire_model=True))
-        
+    
+    @split_timer  
     def requires(self):
         # Each branch requires the scan for the corresponding POI
-        return {'all': ScanPOIs.req(self, pois=self.COMBINE_POIS, n_points=self.n_points)}
+        return {'all': HaddPOIs.req(self, pois=self.COMBINE_POIS, n_points=self.n_points)}
     
     def output(self):
         return self.local_target(f"all.txt")
     
+    @split_timer
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.model}, will output {self.output()}")
         # Write to file
         with open(self.output().path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
-            scan_target = self.input()['all'][0]
+            scan_target = self.input()['all']
             assert isinstance(scan_target, law.LocalFileTarget)
             f.write(f"all {scan_target.path}\n")

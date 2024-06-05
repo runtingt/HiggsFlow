@@ -3,3 +3,4 @@ import tasks.combine
 import tasks.remote
 import tasks.transfer
 import tasks.notify
+import tasks.interpolation
