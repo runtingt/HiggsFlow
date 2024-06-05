@@ -3,8 +3,9 @@ import re
 import law
 import luigi
 import shutil
+import numpy as np
 from typing import Dict
-from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, SetSMVals, GetPOIRanges, GetFreezeList
+from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, SetSMVals, GetPOIRanges, GetFreezeList, GetGeneratePOIs
 from tasks.base import BaseTask, ForceableWithNewer
 from tasks.remote import HTCondorCPU
 
@@ -42,9 +43,15 @@ class CombineBase(BaseTask):
         description="model to use for the combination; default is STXStoSMEFTExpandedLinearStatOnly"
     )
     
+    # TODO handle multiple types and attributes
     types = luigi.Parameter(
         default="observed",
         description="type of scan to run; default is observed" # TODO change this to something sensible
+    )
+    
+    attributes = luigi.Parameter(
+        default="nominal",
+        description="attributes of the scan to run; default is nominal"
     )
     
     def __init__(self, *args, **kwargs):
@@ -70,6 +77,16 @@ class CombineBase(BaseTask):
         # Define frequently used commands
         self.base_command = f"cd {os.environ['CMSSW_PATH']}; cmsenv; cd {os.environ['ANALYSIS_PATH']}; ulimit -s unlimited; "
         self.time_command = "/usr/bin/time -v"
+        
+        # Parse the model
+        self.COMBINE_OPTIONS = GetMinimizerOpts(self.model)
+        self.COMBINE_SET_OPTIONS = ""
+        self.COMBINE_POIS = GetPOIsList(self.model)
+        self.COMBINE_POIS_TO_RUN = GetGeneratePOIs(self.model)
+        self.COMBINE_RANGES = GetPOIRanges(self.model)
+        self.COMBINE_FREEZE = GetFreezeList(self.model)
+        if self.COMBINE_FREEZE != '':
+            self.COMBINE_FREEZE = ',' + self.COMBINE_FREEZE
         
     def run_cmd(self, cmd: str) -> None:
         logger.info(f"Running command: {cmd}")
@@ -137,32 +154,20 @@ class InitialFit(CombineBase, ForceableWithNewer, HTCondorCPU, law.LocalWorkflow
         return []
     
     def requires(self):
-        return TextToWorkspace.req(self) # No dependencies for the branch, just the workflow itself
+        return TextToWorkspace.req(self)
     
     def output(self):
-        return {'tree': self.local_target(f"higgsCombine.initial.{self.channel}.{self.model}.{self.types}.MultiDimFit.mH.{self.MH}.123456.root"),
-                'log': self.local_target(f"initialfit_{self.channel}_{self.model}_local.log;")}
+        return {'tree': self.local_target(f"higgsCombine.initial.{self.channel}.{self.model}.{self.types}.MultiDimFit.mH{self.MH}.123456.root"),
+                'log': self.local_target(f"initialfit_{self.channel}_{self.model}_local.log")}
     
     def run(self):        
         logger.info(f"Running: InitialFit, will output {self.output()}")
-        channel = self.channel
-        model = self.model 
-        types = self.types
-
-        # Get options from getPOIs 
-        # TODO offload this to base
-        COMBINE_OPTIONS = GetMinimizerOpts(model)
-        COMBINE_POIS = GetPOIsList(model)
-        COMBINE_SET = SetSMVals(model)
-        COMBINE_RANGES = GetPOIRanges(model)
-        COMBINE_FREEZE = GetFreezeList(model)
-        if COMBINE_FREEZE != '':
-            COMBINE_FREEZE = ',' + COMBINE_FREEZE
         
+        # Build generate string
         GENERATE_STR = "n;t;toysFrequentist;"
-        if 'observed' in types: GENERATE_STR += ";observed,!,!"
-        if 'prefit_asimov' in types: GENERATE_STR += ";prefit_asimov,-1,!"
-        if 'postfit_asimov' in types: GENERATE_STR += ";postfit_asimov,-1, "
+        if 'observed' in self.types: GENERATE_STR += ";observed,!,!"
+        if 'prefit_asimov' in self.types: GENERATE_STR += ";prefit_asimov,-1,!"
+        if 'postfit_asimov' in self.types: GENERATE_STR += ";postfit_asimov,-1, "
         input = self.input()
         assert isinstance(input, law.LocalFileTarget)
         ws_path = input.path
@@ -172,11 +177,105 @@ class InitialFit(CombineBase, ForceableWithNewer, HTCondorCPU, law.LocalWorkflow
         cmd += (
             f"{self.time_command} combineTool.py -M MultiDimFit "
             f"-m {self.MH} -d {ws_path} "
-            f"--redefineSignalPOIs {COMBINE_POIS} --setParameters {COMBINE_SET} "
-            f"--setParameterRanges {COMBINE_RANGES} --freezeParameters MH{COMBINE_FREEZE} "
-            f"--generate '{GENERATE_STR}' --saveToys --saveWorkspace {COMBINE_OPTIONS} "
-            f"-n .initial.{channel}.{model} "
-            f"&> {self.output()['tree'].dirname}/initialfit_{channel}_{model}_local.log;"
+            f"--redefineSignalPOIs {self.COMBINE_POIS} --setParameters {self.COMBINE_SET} "
+            f"--setParameterRanges {self.COMBINE_RANGES} --freezeParameters MH{self.COMBINE_FREEZE} "
+            f"--generate '{GENERATE_STR}' --saveToys --saveWorkspace {self.COMBINE_OPTIONS} "
+            f"-n .initial.{self.channel}.{self.model} "
+            f"&> {self.output()['tree'].dirname}/initialfit_{self.channel}_{self.model}_local.log;"
         )
         cmd += f"mv {self.output()['tree'].basename} {self.output()['tree'].path};"
+        self.run_cmd(cmd)
+
+class ScanBase(CombineBase, HTCondorCPU, law.LocalWorkflow):
+    """
+    Base class for running a scan
+    """
+    n_points = luigi.IntParameter(
+        default=10,
+        description="number of points to run; default is 10"
+    )
+    
+    points_per_job = luigi.IntParameter(
+        default=1,
+        description="number of points to run per job; default is 1"
+    )
+    
+    def create_branch_map(self):
+        return {i: i for i in range(int(np.ceil(self.n_points / self.points_per_job)))}
+    
+    def workflow_requires(self):
+        return [] 
+    
+    def requires(self):
+        return InitialFit.req(self)
+    
+class ScanPOIBase(ScanBase):
+    """
+    Base class for running a single-POI scan
+    """
+    poi = luigi.Parameter(
+        default="r",
+        description="parameter of interest to scan; default is r"
+    )
+    
+    scan_method = luigi.Parameter(
+        default="grid",
+        description="scan method to use; default is grid"
+    )
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        self.start = self.branch * self.points_per_job
+        self.end = min(self.start + (self.points_per_job-1), self.n_points)
+        
+    def output(self):
+        return self.local_target(f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.poi}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        
+class ScanPOIGrid(ScanPOIBase):
+    """
+    Derived class for scanning a single poi using a grid
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **dict(kwargs, scan_method="grid"))
+        
+    def run(self):
+        logger.info(f"Running: ScanPOIGrid for {self.poi}, will output {self.output()}")        
+        initial_fit_target = self.input()['tree']
+        assert isinstance(initial_fit_target, law.LocalFileTarget)
+        initial_path = initial_fit_target.path
+
+        # Build strings
+        # TODO offload to parent class
+        SKIP_OPTIONS = "--skipInitialFit"
+        
+        GENERATE_STR = "d;D;n;"
+        if 'observed' in self.types: GENERATE_STR += f";{initial_path},data_obs,observed"
+        if 'prefit_asimov' in self.types: GENERATE_STR += f";{initial_path},toys/toy_asimov,prefit_asimov"
+        if 'postfit_asimov' in self.types: GENERATE_STR += f";{initial_path},toys/toy_asimov,postfit_asimov"
+        
+        ATTRIBUTES_STR = "freezeWithAttributes;n;"
+        if "nominal" in self.attributes: ATTRIBUTES_STR += ";,nominal"
+        if "fr.all" in self.attributes: ATTRIBUTES_STR += ";all,fr.all"
+        if "fr.sigth" in self.attributes: ATTRIBUTES_STR += ";sigTheory,fr.sigth"
+        if "fr.sigbkgth" in self.attributes: 
+            # Requires doubling of commas to account for two frozen attributes
+            ATTRIBUTES_STR = re.sub(",", ",,", ATTRIBUTES_STR)
+            ATTRIBUTES_STR += ";sigTheory,bkgTheory,,fr.sigbkgth"
+
+        # TODO offload to parent class
+        cmd = self.base_command
+        cmd += (
+            f" {self.time_command} combineTool.py -M MultiDimFit -m {self.MH}"
+            f" --generate \"{GENERATE_STR}\" \"{ATTRIBUTES_STR}\""# \"{self.COMBINE_POIS_TO_RUN}\""
+            f" --freezeParameters MH{self.COMBINE_FREEZE} --redefineSignalPOIs {self.COMBINE_POIS}"
+            f" --setParameterRanges {self.COMBINE_RANGES} {self.COMBINE_OPTIONS}"
+            f" -n .scan.{self.channel}.{self.model}.{self.scan_method}.{self.poi}.POINTS.{self.start}.{self.end}"
+            f" --snapshotName \"MultiDimFit\" --algo grid --saveInactivePOI 1"
+            f" {SKIP_OPTIONS} {self.COMBINE_SET_OPTIONS}"
+            f" --points {self.n_points} --alignEdges 1 -P {self.poi}"
+            f" --firstPoint {self.start} --lastPoint {self.end}"
+            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.poi}_local.log;"
+        )
+        cmd += f"mv {self.output().basename} {self.output().path}"
         self.run_cmd(cmd)
