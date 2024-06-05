@@ -15,3 +15,7 @@ To produce the `*_tasks.pdf` files, use `pyreverse` from `pylint` to run
 ```sh
 pyreverse -o pdf -p tasks tasks/
 ```
+
+## Changes made to Combine
+<!-- TODO just fork combine -->
+MultiDimFit.cc: change `ceil` to `floor` in `doGrid()`

@@ -6,8 +6,8 @@ import shutil
 import numpy as np
 from io import TextIOWrapper
 from typing import Dict
-from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, SetSMVals, GetPOIRanges, GetFreezeList, GetGeneratePOIs
-from tasks.base import BaseTask, ForceableWithNewer
+from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList
+from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU
 
 from law.logger import get_logger
@@ -83,7 +83,7 @@ class CombineBase(ForceableWithNewer):
         self.COMBINE_OPTIONS = GetMinimizerOpts(self.model)
         self.COMBINE_SET_OPTIONS = ""
         self.COMBINE_POIS = GetPOIsList(self.model)
-        self.COMBINE_POIS_TO_RUN = GetGeneratePOIs(self.model)
+        # self.COMBINE_POIS_TO_RUN = GetGeneratePOIs(self.model)
         self.COMBINE_RANGES = GetPOIRanges(self.model)
         self.COMBINE_FREEZE = GetFreezeList(self.model)
         if self.COMBINE_FREEZE != '':
@@ -202,8 +202,8 @@ class POITask(CombineBase):
     )
     
     points_per_job = luigi.IntParameter(
-        default=1,
-        description="number of points to run per job; default is 1"
+        default=2,
+        description="number of points to run per job; default is 2"
     )
 
     scan_method = luigi.Parameter(
@@ -212,10 +212,15 @@ class POITask(CombineBase):
     )
     
     def __init__(self, *args, **kwargs):
+        entire_model = kwargs.pop("entire_model", False)
         super().__init__(*args, **kwargs)
         
-        # Process pois
-        self.pois_split = str(self.pois).split(',')
+        # Process pois, including the flag to use the entire model
+        if entire_model:
+            self.pois_split = self.COMBINE_POIS.split(',')
+            self.pois = self.COMBINE_POIS
+        else:
+            self.pois_split = str(self.pois).split(',')
         self.POIS_TO_RUN = " ".join([f"-P {poi}" for poi in self.pois_split])
         self.POI_NAME_STR = "_".join(self.pois_split)
         for poi in self.pois_split:
@@ -399,12 +404,22 @@ class PlotPOIs(POITask):
             )
             
         elif len(self.pois_split) == 2:
+            # Get the x and y ranges
+            range_strs = self.COMBINE_RANGES.split(':')
+            for range_str in range_strs:
+                if self.pois_split[0] in range_str:
+                    x_range = range_str.strip(self.pois_split[0]+'=')
+                if self.pois_split[1] in range_str:
+                    y_range = range_str.strip(self.pois_split[1]+'=')
+            
             plotting_script = 'generic2D.py'
             plotting_options = (
                 f"-o {os.path.splitext(self.output()[0].basename)[0]} -f {hadd_target.path} "
                 f"--remin --sm-point 0,0 --translate pois.json "
-                f"--x-axis {self.pois_split[0]} --y-axis {self.pois_split[1]}"
+                f"--x-axis {self.pois_split[0]} --y-axis {self.pois_split[1]} "
+                f"--x-range=\"{x_range}\" --y-range=\"{y_range}\" "
             )
+            plotting_options += f"; mv {os.path.splitext(self.output()[0].basename)[0]}* {self.output()[0].dirname};"
         else:
             raise ValueError(f"Cannot plot {len(self.pois_split)} (as >2) POIs")
         
@@ -417,8 +432,9 @@ class ScanSingles(POITask):
     Takes a model and a number of points, performs a 1D profiled scan of each POI
     """
     def __init__(self, *args, **kwargs):
-        CombineBase.__init__(self, *args, **kwargs)
-        super().__init__(pois=self.COMBINE_POIS)
+        # Just pass in the model's pois
+        # TODO can we do this in a cleaner way?
+        super().__init__(*args, **dict(kwargs, entire_model=True))
         
     def requires(self):
         # Each branch requires the scan for the corresponding POI
@@ -428,7 +444,7 @@ class ScanSingles(POITask):
         return self.local_target(f"singles.txt")
     
     def run(self):
-        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        logger.info(f"Running: {self.__class__.__name__} for {self.pois_split}, will output {self.output()}")
         # Write to file
         with open(self.output().path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
@@ -442,8 +458,9 @@ class ScanPairs(POITask):
     Takes a model and a number of points, performs a 2D profiled scan of each pair of POIs
     """
     def __init__(self, *args, **kwargs):
-        CombineBase.__init__(self, *args, **kwargs)
-        super().__init__(pois=self.COMBINE_POIS)
+        # Just pass in the model's pois
+        # TODO can we do this in a cleaner way?
+        super().__init__(*args, **dict(kwargs, entire_model=True))
         
         # Compute pairs
         from itertools import combinations
@@ -457,12 +474,12 @@ class ScanPairs(POITask):
         return self.local_target(f"pairs.txt")
     
     def run(self):
-        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        logger.info(f"Running: {self.__class__.__name__} for {self.poi_pairs}, will output {self.output()}")
         # Write to file
         with open(self.output().path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
             for pair in self.poi_pairs:
-                scan_target = self.input()[pair]
+                scan_target = self.input()[pair][0]
                 assert isinstance(scan_target, law.LocalFileTarget)
                 f.write(f"{pair} {scan_target.path}\n")
 
@@ -471,8 +488,9 @@ class ScanAll(POITask):
     Take a model and a number of points, perform a scan of all POIs simultaneously
     """
     def __init__(self, *args, **kwargs):
-        CombineBase.__init__(self, *args, **kwargs)
-        super().__init__(self, *args, **dict(kwargs, pois=self.COMBINE_POIS))
+        # Just pass in the model's pois
+        # TODO can we do this in a cleaner way?
+        super().__init__(*args, **dict(kwargs, entire_model=True))
         
     def requires(self):
         # Each branch requires the scan for the corresponding POI
@@ -482,7 +500,7 @@ class ScanAll(POITask):
         return self.local_target(f"all.txt")
     
     def run(self):
-        logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
+        logger.info(f"Running: {self.__class__.__name__} for {self.model}, will output {self.output()}")
         # Write to file
         with open(self.output().path, 'w') as f:
             assert isinstance(f, TextIOWrapper)
