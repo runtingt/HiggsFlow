@@ -265,7 +265,7 @@ class POITask(CombineBase):
     is_all = luigi.BoolParameter(
         default=False,
         description="run all POIs simultaneously; default is False"
-    )
+    ) # NOTE this is different to the entire_model parameter, which is used by workflow tasks
     
     def __init__(self, *args, **kwargs):
         entire_model = kwargs.pop("entire_model", False)
