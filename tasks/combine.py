@@ -44,6 +44,7 @@ class CombineBase(ForceableWithNewer):
         description="the name of the root inputs file; default is comb_2021_hgg.inputs.root"
     )
     
+    # TODO offer getPOIs as an autocomplete
     model = luigi.Parameter(
         default="STXStoSMEFTExpandedLinearStatOnly",
         description="model to use for the combination; default is STXStoSMEFTExpandedLinearStatOnly"
@@ -218,7 +219,11 @@ class Impacts(CombineBase, HTCondorCPU, law.LocalWorkflow):
         return InitialFit.req(self)
     
     def output(self):
-        return self.local_target(f"higgsCombine.robustHesse.{self.channel}.{self.model}.{self.types}.root")
+        return {
+            'robustFit' : self.local_target(f"higgsCombine.robustHesse.{self.channel}.{self.model}.{self.types}.MultiDimFit.mH125.38.root"),
+            'hessian' : self.local_target(f"hessian_{self.channel}_{self.model}.{self.types}.root"),
+            'robustHesse': self.local_target(f"robustHesse.robustHesse.{self.channel}.{self.model}.{self.types}.root")
+        }
     
     def run(self):
         initial_target = self.input()['tree']
@@ -238,9 +243,10 @@ class Impacts(CombineBase, HTCondorCPU, law.LocalWorkflow):
             f"-D {dataset} {self.COMBINE_OPTIONS} --robustHesse 1 --robustFit 1 "
             f"--robustHesseSave hessian_{self.channel}_{self.model}.{self.types}.root "
             f"-n .robustHesse.{self.channel}.{self.model}.{self.types} -v 3 "
-            f"&> {self.output().dirname}/impacts_{self.channel}_{self.model}_{self.types}_local.log;"
+            f"&> {self.output()['robustHesse'].dirname}/impacts_{self.channel}_{self.model}_{self.types}_local.log;"
             )
-        cmd += f"mv {self.output().basename} {self.output().path};"
+        for output in self.output().values():
+            cmd += f"mv {output.basename} {output.path};"
         self.run_cmd(cmd)            
 
 class POITask(CombineBase):

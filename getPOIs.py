@@ -244,8 +244,8 @@ getPOIs = {
         "POIs": {
             "lEV0XE3": {"range": [-5., 5.], "points": 20, "SMVal": 0.0},
             "lEV1XE2": {"range": [-3., 2.], "points": 20, "SMVal": 0.0},
-            "lEV2XE1": {"range": [-4, 5.], "points": 20, "SMVal": 0.0},
-            "lEV3": {"range": [-1., 1.5], "points": 20, "SMVal": 0.0},
+            "lEV2XE1": {"range": [-1.5, 5.], "points": 20, "SMVal": 0.0},
+            "lEV3": {"range": [-1., 2.], "points": 20, "SMVal": 0.0},
             "lEV4": {"range": [-6, 1], "points": 20, "SMVal": 0.0},
         },
         "POIsFix": {},
