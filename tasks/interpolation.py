@@ -2,9 +2,9 @@ import law
 import pickle
 import numpy as np
 import json
-from io import TextIOWrapper
 from itertools import combinations
 from tasks.combine import CombineBase, POITask, ScanAll
+from tasks.utils import ScanMethod
 from interpolator.base import rbfInterpolator
 from interpolator.utils import Data
 from interpolator.profiler import profile1D, profile2D
@@ -121,7 +121,7 @@ class InterpolatePair(POITask):
 
     def output(self):
         return {
-            'profile' : self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{self.pair}.npy")
+            'profile' : self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{'_'.join(self.pair)}.npy")
         }
     
     def run(self):    
@@ -142,7 +142,8 @@ class InterpolatePair(POITask):
         # Save the profile
         np.save(self.output()['profile'].path, np.array([x_vals, y_vals, z_vals]))
 
-class InterpolateSingles(POITask):
+# TODO merge pairs and singles  
+class ProfileInterpolated1D(POITask, ScanMethod):
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
@@ -152,20 +153,34 @@ class InterpolateSingles(POITask):
         return {poi: InterpolateSingle.req(self, pois=poi) for poi in self.pois_split}
     
     def output(self):
-        return self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.json")
+        return {
+            'limits' : self.local_target(f"singles.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.json"),
+            'profiles' : {
+                poi: self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{poi}.npy") for poi in self.pois_split
+            }
+        }
     
     def run(self):
-        # Merge the results
+        # TODO make sure .path is picked up
+        # Merge the limits
         results = {poi: self.input()[poi]['limits'] for poi in self.pois_split}
         results_dict = {self.model: {}}
         for poi, result in results.items():
             assert isinstance(result, law.LocalFileTarget)
             with open(result.path, 'r') as f:
                 results_dict[self.model][poi] = json.load(f)[self.model][poi]
-        with open(self.output().path, 'w') as f:
+        with open(self.output()['limits'].path, 'w') as f:
             json.dump(results_dict, f, indent=4)
-
-class InterpolatePairs(POITask):
+        
+        # Merge the profiles
+        profiles = {poi: self.input()[poi]['profile'] for poi in self.pois_split}
+        for poi, profile in profiles.items():
+            assert isinstance(profile, law.LocalFileTarget)
+            with open(profile.path, 'rb') as f:
+                profile = np.load(f)
+            np.save(self.output()['profiles'][poi].path, profile)
+  
+class ProfileInterpolated2D(POITask, ScanMethod):
     def __init__(self, *args, **kwargs):
         # Just pass in the model's pois
         # TODO can we do this in a cleaner way?
@@ -174,14 +189,21 @@ class InterpolatePairs(POITask):
         # Compute pairs
         self.poi_pairs = list(map(','.join, list(combinations(self.pois_split, 2))))
     
-    def output(self):
-        return self.local_target(f"pairs.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.txt")
-    
     def requires(self):
         return {pair: InterpolatePair.req(self, pois=pair) for pair in self.poi_pairs}
+
+    def output(self):
+        return {
+            'profiles' : {
+                pair: self.local_target(f"profile.{self.channel}.{self.model}.{self.scan_method}.{self.types}.{self.attributes}.{'_'.join(pair.split(','))}.npy") for pair in self.poi_pairs
+            }
+        }
     
     def run(self):
-        # Write to log
-        with open(self.output().path, 'w') as f:
-            assert isinstance(f, TextIOWrapper)
-            f.write('\n'.join(self.poi_pairs))
+        # Merge the profiles
+        profiles = {pair: self.input()[pair]['profile'] for pair in self.poi_pairs}
+        for pair, profile in profiles.items():
+            assert isinstance(profile, law.LocalFileTarget)
+            with open(profile.path, 'rb') as f:
+                profile = np.load(f)
+            np.save(self.output()['profiles'][pair].path, profile)            

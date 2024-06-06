@@ -58,7 +58,7 @@ class ForceableTask(BaseTask):
     
     def run(self): # NOTE: This must be called by the derived class
         self.has_run = True
-        print('ForceableTask run method was called')
+        # print('ForceableTask run method was called')
     
     def complete(self):
         if self.force and not self.has_run:
