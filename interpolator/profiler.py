@@ -12,17 +12,17 @@ def profile1D(interp: rbfInterpolator, poi: str, num: int=50) -> dict:
     Get the 1D profiled scan for the specified POI, using an interpolator
     """    
     # Generate x values
-    bounds = interp.bounds[interp.pois.index(poi)]
+    bounds = interp.bounds[interp.nominal_pois.index(poi)]
     xs = np.linspace(bounds[0], bounds[1], num=num)
     ys = []
     
     # Profile
-    free_keys = [key for key in interp.pois if key != poi]
+    free_keys = [key for key in interp.nominal_pois if key != poi]
     for x in xs:
         ys.append(interp.minimize(free_keys, fixed_vals={poi: [x]})['fun'])
-    sim_res = interp.minimize(interp.pois, {})
+    sim_res = interp.minimize(interp.nominal_pois, {})
     interp_min = sim_res['fun']
-    interp_min_x = sim_res['x'][interp.pois.index(poi)]
+    interp_min_x = sim_res['x'][interp.nominal_pois.index(poi)]
     
     return {poi: xs, 'deltaNLL': ys, 'best': interp_min, 'best_x': interp_min_x}
 
@@ -33,12 +33,12 @@ def profile2D(interp: rbfInterpolator, pois: List[str], num: int) -> None:
     """
 
     # Get free keys
-    free_keys = [key for key in interp.pois if key not in pois]
+    free_keys = [key for key in interp.nominal_pois if key not in pois]
     
     # Get bounds for fixed parameters
     bounds = []
     for poi in pois:
-        bounds.append(interp.bounds[interp.pois.index(poi)])
+        bounds.append(interp.bounds[interp.nominal_pois.index(poi)])
     
     # Profile
     x = np.linspace(bounds[0][0], bounds[0][1], num)
@@ -55,9 +55,9 @@ def profile2D(interp: rbfInterpolator, pois: List[str], num: int) -> None:
     Z = Z.reshape(X.shape)
         
     # Get overall minimum
-    sim_res = interp.minimize(interp.pois, {})
+    sim_res = interp.minimize(interp.nominal_pois, {})
     interp_min = sim_res['fun']
-    interp_min_x = sim_res['x'][interp.pois.index(poi)]
+    interp_min_x = sim_res['x'][interp.nominal_pois.index(poi)]
     
     # Save
     return {pois[0]: X, pois[1]: Y, 'deltaNLL': Z, 'best': interp_min, 'best_x': interp_min_x}

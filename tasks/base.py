@@ -1,9 +1,11 @@
 import os
 import law
+import law.target
 import luigi
 import numpy as np
 from typing import Dict, List, Tuple, Union
 from law.task.base import BaseTask as LawBaseTask # For proper type-hinting
+from law.target.base import Target
 from law.logger import get_logger
 
 logger = get_logger('luigi-interface')
@@ -22,10 +24,13 @@ def targetAsList(target: Union[Dict, List, Tuple, law.LocalFileTarget]) -> List[
 def flatten(collection):
     result = []
     for i in collection:
-        if isinstance(i, Union[Dict, List, Tuple]):
-            result.extend(flatten(targetAsList(i)))
+        if isinstance(i, law.TargetCollection):
+            result.extend(flatten(i.targets))
         else:
-            result.append(i)
+            if isinstance(i, Union[Dict, List, Tuple]):
+                result.extend(flatten(targetAsList(i)))
+            elif isinstance(i, Target):
+                result.append(i)
     return result
 
 # Get the last modification time of a target
@@ -132,6 +137,8 @@ class ForceNewerOutputTask(BaseTask):
         newest_input = inputs_list[newest_idx]
         newest_input_time = input_times[newest_idx]
         output_times = [getTargetModificationTime(output) for output in outputs_to_check]
+        if len(output_times) == 0:
+            return BaseTask.complete(self)
         oldest_idx = np.argmin(output_times)
         oldest_output = outputs_list[oldest_idx]
         oldest_output_time = output_times[oldest_idx]

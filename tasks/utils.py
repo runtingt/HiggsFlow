@@ -1,3 +1,6 @@
+import law
+import luigi
+from law.task.base import BaseTask as LawBaseTask
 from tasks.base import ForceableWithNewer
 
 colors = ["#5790fc", "#f89c20", "#e42536", "#964a8b", "#9c9ca1", "#7a21dd"]
@@ -17,3 +20,13 @@ class ScanMethod(ForceableWithNewer):
 
     def output(self):
         raise NotImplementedError("ScanMethod is a base class and should not be used directly")             
+
+class GenericWrapper(law.WrapperTask):
+    task_class = luigi.TaskParameter(description="The task class to wrap")
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+    
+    def requires(self):
+        assert isinstance(self.task_class, LawBaseTask)
+        return self.task_class.req(self.task_class)

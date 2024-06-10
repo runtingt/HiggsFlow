@@ -91,6 +91,7 @@ class rbfInterpolator(Interpolator):
         super().initialise(data_config)
         
         self.pois = list(data_config["POIs"].keys())
+        self.nominal_pois = self.pois
         self.bounds = [tuple(*val.values()) 
                        for val in data_config["POIs"].values()]
         self.stem = (f"scan.{data_config['channel']}.{data_config['model']}." +

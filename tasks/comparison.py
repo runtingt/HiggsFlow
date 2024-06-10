@@ -6,6 +6,7 @@ import mplhep as hep
 import uproot
 import pandas as pd
 import pickle
+import os
 from scipy.stats import norm
 from interpolator.base import Interpolator
 from matplotlib import pyplot as plt
@@ -32,6 +33,18 @@ comparisons_dict = {
                 '2DScans' : 'hgg_statonly2D_grid_interp',
                 'nDScans' : 'hgg_statonly2D_grid_interp',
                 'nDEval'  : 'hgg_statonly2D_grid_interp',
+                },
+            'STXS' : {
+                '1DScans' : 'hgg_statonly2D_STXS',
+                '2DScans' : 'hgg_statonly2D_STXS',
+                'nDScans' : 'hgg_statonly2D_STXS',
+                'nDEval'  : 'hgg_statonly2D_STXS',
+                },
+            'SMEFT' : {
+                '1DScans' : 'hgg_statonly2D_SMEFT',
+                '2DScans' : 'hgg_statonly2D_SMEFT',
+                'nDScans' : 'hgg_statonly2D_SMEFT',
+                'nDEval'  : 'hgg_statonly2D_SMEFT',
                 },
             }
         }
@@ -70,14 +83,13 @@ class Compare(ForceableWithNewer):
             "key defined in comparisons_dict."
     )
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def initialise(self):
         # Unpack the model
         with open(BuildComparison(comparison_name=self.comparison_name).output().path, 'r') as f:
             self.comparison = dict(json.load(f))
         self.truth_model = dict(self.comparison['truth'])
         self.approx_models = dict(self.comparison['approximations'])
-        
+
         # Get the POIs from the truth model
         self.pois = list(self.process_limit(models_dict[self.truth_model['1DScans']].get_reqs()['1D'].output()['limits'],
                                             models_dict[self.truth_model['1DScans']].model).keys())
@@ -362,6 +374,7 @@ class Compare(ForceableWithNewer):
         plt.savefig(self.output()['corner'].path, bbox_inches='tight', dpi=125)
     
     def run(self):
+        self.initialise()
         self.make_fishbone()
         self.make_diff1D()
         self.make_corner()
