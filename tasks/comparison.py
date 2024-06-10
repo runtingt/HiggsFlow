@@ -9,11 +9,13 @@ import pickle
 import os
 from scipy.stats import norm
 from interpolator.base import Interpolator
+from interpolator.base import Interpolator
 from matplotlib import pyplot as plt
 from matplotlib.gridspec import GridSpec
 from collections import defaultdict
 from tasks.base import ForceableWithNewer
 from tasks.utils import colors
+from tasks.models import BuildModel, models_dict
 from tasks.models import BuildModel, models_dict
 
 hep.style.use(hep.style.CMS)
@@ -97,7 +99,16 @@ class Compare(ForceableWithNewer):
     def requires(self):
         return BuildComparison(comparison_name=self.comparison_name)
     
+        return BuildComparison(comparison_name=self.comparison_name)
+    
     def output(self):
+        return {
+            'fishbone': self.local_target(f"fishbone_{self.comparison_name}.png"),
+            'diff1D': self.local_target(f"diff1D_{self.comparison_name}.png"),
+            'corner': self.local_target(f"corner_{self.comparison_name}.png"),
+        }
+    
+    def process_limit(self, limit_json: law.LocalFileTarget, model_name: str):
         return {
             'fishbone': self.local_target(f"fishbone_{self.comparison_name}.png"),
             'diff1D': self.local_target(f"diff1D_{self.comparison_name}.png"),
@@ -107,6 +118,7 @@ class Compare(ForceableWithNewer):
     def process_limit(self, limit_json: law.LocalFileTarget, model_name: str):
         results = defaultdict(lambda: defaultdict(dict))
         with open(limit_json.path, 'r') as f:
+            poi_limits = dict(json.load(f)[model_name])
             poi_limits = dict(json.load(f)[model_name])
             for poi, limit_info in poi_limits.items():
                 results[poi]['best'] = limit_info['Val']
@@ -123,7 +135,17 @@ class Compare(ForceableWithNewer):
             scan1D_models[name] = models_dict[approx_model['1DScans']]
             
         # Extract limits
+        # Extract models
+        scan1D_models = {'truth' : models_dict[self.truth_model['1DScans']]}
+        for name, approx_model in self.approx_models.items():
+            scan1D_models[name] = models_dict[approx_model['1DScans']]
+            
+        # Extract limits
         results = defaultdict(lambda: defaultdict(dict))
+        for name, model in scan1D_models.items():
+            scan1D_limits = model.get_reqs()['1D'].output()['limits']
+            assert isinstance(scan1D_limits, law.LocalFileTarget)
+            results[name] = self.process_limit(scan1D_limits, model.model)
         for name, model in scan1D_models.items():
             scan1D_limits = model.get_reqs()['1D'].output()['limits']
             assert isinstance(scan1D_limits, law.LocalFileTarget)
@@ -132,6 +154,7 @@ class Compare(ForceableWithNewer):
         # Plot
         fig, ax = plt.subplots(1, 1, figsize=(16, 9))
         assert isinstance(ax, plt.Axes)
+        xs = np.arange(len(self.pois))
         xs = np.arange(len(self.pois))
         levels = [1, 4]
         ci_styles = ['-', '--']
@@ -146,10 +169,12 @@ class Compare(ForceableWithNewer):
         for i, (model, shift) in enumerate(zip(results.keys(), shifts)):
             # Extract the best fits
             best_fits = [results[model][poi]['best'] for poi in self.pois]
+            best_fits = [results[model][poi]['best'] for poi in self.pois]
             ax.scatter(xs+shift, best_fits, s=100, zorder=2, c=colors[i])
             
             # Extract the CIs
             for j in range(len(levels)):
+                ci = np.array([results[model][poi][f'ci_{j}'] for poi in self.pois]).T
                 ci = np.array([results[model][poi][f'ci_{j}'] for poi in self.pois]).T
                 ax.plot([xs+shift, xs+shift], ci, c=colors[i], 
                         lw=5-2*j, ls=ci_styles[j])
@@ -168,6 +193,7 @@ class Compare(ForceableWithNewer):
         ax.set_ylabel('Parameter value')
         ax.set_xticks(xs)
         ax.set_xticklabels(self.pois)
+        ax.set_xticklabels(self.pois)
         ax.set_xlim((-0.5, xs.max()+1.5))
         ax.set_ylim(-30, 10)
         ax.legend(loc='upper right')
@@ -175,21 +201,35 @@ class Compare(ForceableWithNewer):
         plt.tight_layout()
         plt.savefig(self.output()['fishbone'].path, dpi=125, bbox_inches='tight')
             
+            
     def make_diff1D(self):
         # Get the truth likelihood values
         true_scan = models_dict[self.truth_model['nDScans']].get_reqs()['TruthND'].requires()['all']
         true_vals = true_scan.output()
         assert isinstance(true_vals, law.LocalFileTarget)
         file = uproot.open(true_vals.path)
+        true_scan = models_dict[self.truth_model['nDScans']].get_reqs()['TruthND'].requires()['all']
+        true_vals = true_scan.output()
+        assert isinstance(true_vals, law.LocalFileTarget)
+        file = uproot.open(true_vals.path)
         limit = file['limit']
         scan_df = pd.DataFrame(limit.arrays(self.pois + ['deltaNLL'], library='pd'))
+        scan_df = pd.DataFrame(limit.arrays(self.pois + ['deltaNLL'], library='pd'))
         file.close()
+
 
         # Process dataframe
         scan_df.drop_duplicates(inplace=True)
         scan_df['deltaq'] = 2*(scan_df['deltaNLL'])
         mask = scan_df['deltaq'] < 10
         
+        # For each approximate model, get its evaluator and evaluate at each point
+        for approx_name, approx_model in self.approx_models.items():
+            evaluator_target = models_dict[approx_model['nDEval']].get_reqs()['NDEval'].output()
+            assert isinstance(evaluator_target, law.LocalFileTarget)
+            with open(evaluator_target.path, 'rb') as f:
+                evaluator = pickle.load(f)
+                assert isinstance(evaluator, Interpolator)
         # For each approximate model, get its evaluator and evaluate at each point
         for approx_name, approx_model in self.approx_models.items():
             evaluator_target = models_dict[approx_model['nDEval']].get_reqs()['NDEval'].output()
@@ -205,9 +245,15 @@ class Compare(ForceableWithNewer):
                 model_out[i] = 2*evaluator.evaluate(pd.DataFrame(d))[0]
             scan_df[approx_name] = model_out
         print(scan_df[mask].describe())
+            for i, pt in enumerate(scan_df[self.pois].to_numpy()):
+                d = {k: [v] for k, v in zip(self.pois, pt)}
+                model_out[i] = 2*evaluator.evaluate(pd.DataFrame(d))[0]
+            scan_df[approx_name] = model_out
+        print(scan_df[mask].describe())
         
         # Plot the difference to the test dataset in a histogram
         fig, axs = plt.subplots(1, 2, figsize=(32, 9))
+        for i, key in enumerate(self.approx_models.keys()):
         for i, key in enumerate(self.approx_models.keys()):
             error = scan_df["deltaq"][mask] - scan_df[key][mask]
             
@@ -253,8 +299,28 @@ class Compare(ForceableWithNewer):
             file.close()
             best[poi] = scan_df[poi][scan_df['deltaNLL'] == 0].values[0]
            
+    def make_corner(self):   
+        truth_single_plots = models_dict[self.truth_model['1DScans']].get_reqs()['1D'].requires()
+        truth_pair_plots = models_dict[self.truth_model['1DScans']].get_reqs()['2D']
+        
+        # Get best fits
+        best = {}
+        for poi in self.pois:
+            truth_single_plot = truth_single_plots[poi]
+            truth_single = truth_single_plot.input()
+            assert isinstance(truth_single, law.LocalFileTarget)
+            file = uproot.open(truth_single.path)
+            limit = file['limit']
+            scan_df = pd.DataFrame(limit.arrays(library='pd'))
+            file.close()
+            best[poi] = scan_df[poi][scan_df['deltaNLL'] == 0].values[0]
+           
         # Plot
         fig = plt.figure(figsize=(45, 30))
+        gs = GridSpec(len(self.pois), len(self.pois), hspace=0., wspace=0.)
+        for i in range(len(self.pois)):
+            for j in range(len(self.pois)):
+                ax = fig.add_subplot(gs[i*len(self.pois) + j])
         gs = GridSpec(len(self.pois), len(self.pois), hspace=0., wspace=0.)
         for i in range(len(self.pois)):
             for j in range(len(self.pois)):
@@ -264,7 +330,9 @@ class Compare(ForceableWithNewer):
                     ax.axis('off')
                     # Add legend
                     if i == 0 and j == len(self.pois)-1:
+                    if i == 0 and j == len(self.pois)-1:
                         ax.plot(np.inf, np.inf, lw=5, label='truth', c=colors[0])
+                        for k, label in enumerate(self.approx_models.keys()):
                         for k, label in enumerate(self.approx_models.keys()):
                             ax.plot(np.inf, np.inf, lw=5, label=label, c=colors[k+1])
                         ax.legend(loc='upper right', handlelength=2, prop={'size': 54})
@@ -277,16 +345,27 @@ class Compare(ForceableWithNewer):
                     truth_single = truth_single_plot.input()
                     assert isinstance(truth_single, law.LocalFileTarget)
                     file = uproot.open(truth_single.path)
+                elif j == i:  
+                    # Get truth profiled scans
+                    poi = self.pois[i]
+                    truth_single_plot = truth_single_plots[poi]
+                    truth_single = truth_single_plot.input()
+                    assert isinstance(truth_single, law.LocalFileTarget)
+                    file = uproot.open(truth_single.path)
                     limit = file['limit']
                     scan_df = pd.DataFrame(limit.arrays(library='pd'))
                     file.close()
                                                    
                     # Fit truth deltaNLL to a polynomial
+                                                   
+                    # Fit truth deltaNLL to a polynomial
                     scan_df.drop_duplicates(inplace=True)
                     mask = 2*scan_df['deltaNLL'] < 10
                     x = scan_df[self.pois[i]][mask]
+                    x = scan_df[self.pois[i]][mask]
                     y = scan_df['deltaNLL'][mask]
                     p = np.polyfit(x, y, 4)
+                    x_fit = np.linspace(np.min(x), np.max(x), 1000)
                     x_fit = np.linspace(np.min(x), np.max(x), 1000)
                     y_fit = np.polyval(p, x_fit)
                     mask = 2*y_fit < 10
@@ -294,8 +373,14 @@ class Compare(ForceableWithNewer):
                     # Plot
                     ax.plot(x_fit[mask], 2*y_fit[mask], c=colors[0], lw=5)
                     ax.scatter(scan_df[self.pois[i]], 2*scan_df['deltaNLL'], c=colors[0], s=100)
+                    ax.scatter(scan_df[self.pois[i]], 2*scan_df['deltaNLL'], c=colors[0], s=100)
                     
                     # Plot models
+                    for k, approx_model in enumerate(self.approx_models.values()):
+                        # Get the profile
+                        approx_single = models_dict[approx_model['1DScans']].get_reqs()['1D'].output()['profiles'][poi]
+                        assert isinstance(approx_single, law.LocalFileTarget)
+                        profile = np.load(approx_single.path)
                     for k, approx_model in enumerate(self.approx_models.values()):
                         # Get the profile
                         approx_single = models_dict[approx_model['1DScans']].get_reqs()['1D'].output()['profiles'][poi]
@@ -306,6 +391,7 @@ class Compare(ForceableWithNewer):
                         
                     # Annotate
                     ax.set_ylim((0, 12))
+                    ax.set_xlim(truth_single_plot.bounds[i][0]*1.05, truth_single_plot.bounds[i][1]*1.05)
                     ax.set_xlim(truth_single_plot.bounds[i][0]*1.05, truth_single_plot.bounds[i][1]*1.05)
                     shifts = [1.00, 4.00]
                     shiftlabels = ['68%', '95%']
@@ -328,6 +414,8 @@ class Compare(ForceableWithNewer):
                     contours = {}
                     pair = f"{self.pois[j]},{self.pois[i]}"
                     target_plot = truth_pair_plots.input()[pair][2]
+                    pair = f"{self.pois[j]},{self.pois[i]}"
+                    target_plot = truth_pair_plots.input()[pair][2]
                     assert isinstance(target_plot, law.LocalFileTarget)
                     file = uproot.open(target_plot.path)
                     cis = [68, 95]
@@ -345,7 +433,11 @@ class Compare(ForceableWithNewer):
                     
                     # Plot models
                     for k, approx_model in enumerate(self.approx_models.values()):
+                    for k, approx_model in enumerate(self.approx_models.values()):
                         # Load the interpolator
+                        approx_pair = models_dict[approx_model['1DScans']].get_reqs()['2D'].output()['profiles'][pair]
+                        assert isinstance(approx_pair, law.LocalFileTarget)
+                        profile = np.load(approx_pair.path)
                         approx_pair = models_dict[approx_model['1DScans']].get_reqs()['2D'].output()['profiles'][pair]
                         assert isinstance(approx_pair, law.LocalFileTarget)
                         profile = np.load(approx_pair.path)
@@ -360,11 +452,19 @@ class Compare(ForceableWithNewer):
                     ax.set_xlim(truth_pair_plots.bounds[j][0]*1.05, truth_pair_plots.bounds[j][1]*1.05)
                     ax.set_ylim(truth_pair_plots.bounds[i][0]*1.05, truth_pair_plots.bounds[i][1]*1.05)
                     
+                      
+                    # Annotate
+                    ax.set_xlim(truth_pair_plots.bounds[j][0]*1.05, truth_pair_plots.bounds[j][1]*1.05)
+                    ax.set_ylim(truth_pair_plots.bounds[i][0]*1.05, truth_pair_plots.bounds[i][1]*1.05)
+                    
                 # Label
                 if j == 0 and i != 0:
                     ax.set_ylabel(self.pois[i], fontsize=48)
+                    ax.set_ylabel(self.pois[i], fontsize=48)
                 else:
                     ax.tick_params(labelleft=False)
+                if i == len(self.pois)-1:
+                    ax.set_xlabel(self.pois[j], fontsize=48)
                 if i == len(self.pois)-1:
                     ax.set_xlabel(self.pois[j], fontsize=48)
                 else:
