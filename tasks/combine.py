@@ -19,7 +19,7 @@ from itertools import combinations
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU, HTCondorGPU
 from tasks.notify import NotifySlackParameterUTF8, SplitTimeDecorator
-from tasks.utils import deep_merge
+from tasks.utils import deep_merge, need_pre
 
 from law.logger import get_logger
 logger = get_logger('luigi-interface')
@@ -119,6 +119,11 @@ class CombineBase(ForceableWithNewer):
     def run_cmd(self, cmd: str) -> None:
         logger.info(f"Running command: {cmd}")
         os.system(cmd)
+        
+    def run_cmd_with_base(self, cmd: str) -> None:
+        cmd = self.base_command + cmd
+        logger.info(f"Running command: {cmd}")
+        os.system(cmd)
     
 class InputFiles(law.ExternalTask, CombineBase):
     """
@@ -132,6 +137,122 @@ class InputFiles(law.ExternalTask, CombineBase):
         files = {"datacard": datacard, "roo_inputs": roo_inputs}
         return files
     
+class CloneSingle(CombineBase):
+    """
+    Clone a single channel from the CADI github area
+    """
+    def output(self):
+        return self.local_target(os.path.join(os.getenv('HC_PATH'), self.channel))
+    
+    def run(self):
+        # TODO tidy the clone_single script itself
+        cmd = f"$ANALYSIS_PATH/clone_single.sh ssh clean {self.channel};"
+        cmd += f"mv $ANALYSIS_PATH/{self.channel} $HC_PATH"
+        self.run_cmd(cmd)
+        
+class PrePrepare(CombineBase):
+    """
+    Runs the 'pre' step for a channel
+    """
+    # TODO make condor workflow
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.channel not in need_pre:
+            raise ValueError(f"Channel {self.channel} does not need a pre step, only {need_pre} do") 
+    
+    def requires(self):
+        return CloneSingle.req(self)
+    
+    def output(self):
+        return self.local_target(f"log.{self.channel}.txt")
+    
+    def run(self):        
+        if self.channel == "hgg":
+            files = glob.glob("$HC_PATH/hgg/Models/signal/*.root")
+            for f in files: 
+                self.run_cmd_with_base(f"python3 hggCleanWsp.py -w {f}:wsig_13TeV -o {re.sub('.root', '_cleaned.root', f)} 2>&1 >/dev/null")
+            files_cleaned = glob.glob("$HC_PATH/hgg/Models/signal/*_cleaned.root")
+            for f in files_cleaned: 
+                self.run_cmd_with_base(f"python3 signalMemOpt.py --file {f}")
+            files_cleaned_constMH = glob.glob("$HC_PATH/hgg/Models/signal/*constMH.root")       
+            for f in files_cleaned_constMH:
+                self.run_cmd_with_base(f"python3 workspaceExplorer.py -w {f}:wsig_13TeV --optimize 1 -o {re.sub('_cleaned_constMH.root', 'updated.root', f)} 2>&1 >/dev/null")
+            self.run_cmd_with_base("cat $HC_PATH/hgg/Datacard.txt | sed 's/\\\\(signal.*\\\\)\\\\.root/\\\\1_updated.root/g' > $HC_PATH/hgg/DatacardLowMem.txt")
+        
+        elif self.channel == "hzz":
+            for fint in [6,7,8]: # TODO this should be more specific - is it supposed to be by year?
+                files = glob.glob(f"$HC_PATH/hzz/stxs_trueBins/legacy/*{fint}.root")
+                for f in files:
+                    self.run_cmd_with_base(f"python3 signalMemOpt.py --file {f}")
+                # TODO should this be files_constMH? 
+                # It is in the original script but never used
+                for f in files:
+                    self.run_cmd_with_base(f"python3 workspaceExplorer.py -w {f}:w --optimize 2 -o {re.sub('.root', '_updated.root', f)}")
+            self.run_cmd_with_base("cat $HC_PATH/hzz/stxs_trueBins/legacy/card_run2.txt | sed 's/.root/_constMH_updated.root/g' > $HC_PATH/hzz/stxs_trueBins/legacy/card_run2_hzzLowMem.txt")
+
+        elif self.channel == "hmm":
+            self.run_cmd_with_base("python3 hmmCleanWsp.py $HC_PATH/hmm/combination/check_2020_ggh.txt $HC_PATH/hmm/combination/check_2020_ggh125.38.inputs.root")
+            
+        elif self.channel == "hbb_boosted_stxs":
+            self.run_cmd_with_base(f"cd $HC_PATH/hbb_boosted/stxs-stage1-2-fine/testModel/; ./build.sh; cd $ANALYSIS_PATH")
+            
+        elif self.channel == "hinv":
+            for wsp in ["MJ", "MV"]:
+                self.run_cmd_with_base(f"python3 hinvFixFormulas.py $HC_PATH/hinv/combination_alltime/exo-20-004/workspace_{wsp}.root")
+
+        with open(self.output().path, 'w') as f:
+            assert isinstance(f, TextIOWrapper)
+            f.write(f"Channel [{self.channel}] has been optimized")
+        
+class Prepare(CombineBase):
+    """
+    Runs the 'prepare' step for a given channel
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cards_dir = os.path.join(os.getenv("HC_PATH"), "cards")
+        os.makedirs(self.cards_dir, exist_ok=True)
+    
+    def requires(self):
+        if self.channel in need_pre:
+            return PrePrepare.req(self)
+        else:
+            return CloneSingle.req(self)
+        
+    def output(self):
+        return {
+            'log' : self.local_target(f"log.{self.channel}.txt"),
+            'card' : law.LocalFileTarget(f"{self.cards_dir}/comb_2021_{self.channel}.txt.gz"),
+            'inputs' : law.LocalFileTarget(f"{self.cards_dir}/comb_2021_{self.channel}.inputs.root"),
+        }
+    
+    def run(self):
+        PREPARE_OPTIONS = "--prune-asymm-lnN --drop-procs --replace-mc-stats"
+        EXTRA_OPTIONS = ""
+        if self.channel in ["hzg", "hinv"]:
+            EXTRA_OPTIONS = f" --include{self.channel}"
+
+        cmd = self.base_command
+        cmd += "cd $HC_PATH;"
+        cmd += (
+            f"{self.time_command} python3 $ANALYSIS_PATH/prepareComb2021.py "
+            f"{PREPARE_OPTIONS} --select {self.channel} {EXTRA_OPTIONS} "
+            f"&> {self.output()['log'].path}; "
+        )
+        cmd += "cd $ANALYSIS_PATH;"
+        self.run_cmd(cmd)
+
+        # Ugly fix for hmm
+        if self.channel == "hmm":
+            self.run_cmd("gunzip $HC_PATH/comb_2021_hmm.txt.gz")
+            self.run_cmd("sed -i'' 's@sm_yr4_13TeV.root:xs_13TeV@&:RecycleConflictNodes@g' $HC_PATH/comb_2021_hmm.txt")
+            self.run_cmd("sed -i'' 's@sm_br_yr4.root:br@&:RecycleConflictNodes@g' $HC_PATH/comb_2021_hmm.txt")
+            self.run_cmd("gzip $HC_PATH/comb_2021_hmm.txt")
+
+        # Move output of prepare step into the cards directory
+        self.run_cmd(f"mv -v $HC_PATH/comb_2021_{self.channel}.txt.gz {self.output()['card'].path}")
+        self.run_cmd(f"mv -v $HC_PATH/comb_2021_{self.channel}.inputs.root {self.output()['inputs'].path}")
+
 class TextToWorkspace(CombineBase):
     """
     Convert a text file and an input file to a RooWorkspace.

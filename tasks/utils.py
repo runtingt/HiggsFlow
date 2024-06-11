@@ -4,6 +4,7 @@ from law.task.base import BaseTask as LawBaseTask
 from tasks.base import ForceableWithNewer
 
 colors = ["#5790fc", "#f89c20", "#e42536", "#964a8b", "#9c9ca1", "#7a21dd"]
+need_pre = ["hgg", "hzz", "hmm", "hbb_boosted_stxs", "hinv"]
 
 def deep_merge(dict1: dict, dict2: dict):
     for key, value in dict2.items():

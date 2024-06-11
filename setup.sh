@@ -40,6 +40,8 @@ action() {
     export ANALYSIS_PATH="${this_dir}"
     export DATA_PATH="${ANALYSIS_PATH}/data"
     export CMSSW_PATH="/home/hep/tr1123/CMSSW_14_0_0_pre0/src" # TODO get this from the user
+    export HC_PATH="/vols/cms/tr1123/HiggsCombination" # TODO get this from the user
+    mkdir -p "${HC_PATH}"
 
     # Setup EOS if not running on a remote machine
     if [ "$remote" = false ]; then
