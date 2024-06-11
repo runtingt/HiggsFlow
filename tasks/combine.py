@@ -6,12 +6,18 @@ import luigi
 import shutil
 import json
 import numpy as np
+import uproot
+import torch
+import pandas as pd
+import gpytorch
+import glob
+from gaussianProcesses.base import GPModel, EarlyStopper, normalise, unnormalise
 from io import TextIOWrapper
 from typing import Dict
 from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList, SetSMVals
 from itertools import combinations
 from tasks.base import ForceableWithNewer
-from tasks.remote import HTCondorCPU
+from tasks.remote import HTCondorCPU, HTCondorGPU
 from tasks.notify import NotifySlackParameterUTF8, SplitTimeDecorator
 from tasks.utils import deep_merge
 
@@ -268,6 +274,21 @@ class POITask(CombineBase):
         description="number of points to run per job; default is 2"
     )
     
+    points_per_block = luigi.OptionalIntParameter(
+        default=None,
+        description="number of points to run per block, used for GP scanning; default is None"
+    )
+    
+    block_index = luigi.OptionalIntParameter(
+        default=None,
+        description="index of the block to run, used for GP scanning; default is None"
+    )
+    
+    name_ext = luigi.OptionalStrParameter(
+        default=".",
+        description="extension to add to the name; default is an empty string"
+    )
+    
     is_all = luigi.BoolParameter(
         default=False,
         description="run all POIs simultaneously; default is False"
@@ -302,9 +323,9 @@ class GenerateRandom(POITask):
         start = 0
         for i in range(n_jobs):
             end = min(start + (self.points_per_job-1), self.n_points-1)
-            targets.append(self.local_target(f"random_points_{'_'.join(self.pois_split)}_{start}_{end}.txt"))
+            targets.append(self.local_target(f"random_points{self.name_ext}{'_'.join(self.pois_split)}_{start}_{end}.txt"))
             start += self.points_per_job
-        targets.append(self.local_target(f"random_points_{'_'.join(self.pois_split)}.txt"))
+        targets.append(self.local_target(f"random_points{self.name_ext}{'_'.join(self.pois_split)}.txt"))
         return targets
     
     def run(self):      
@@ -314,6 +335,186 @@ class GenerateRandom(POITask):
         points = np.random.uniform(bounds[:, 0], bounds[:, 1], (self.n_points, len(self.pois_split)))
 
         # Write to output to the correct files
+        for i, target in enumerate(self.output()[:-1]):
+            target = self.output()[i]
+            assert isinstance(target, law.LocalFileTarget)
+            with open(target.path, 'w') as f:
+                assert isinstance(f, TextIOWrapper)
+                f.write(self.pois + '\n')
+                for j in range(i*self.points_per_job, min((i+1)*self.points_per_job, self.n_points)):
+                    f.write(','.join(map(str, points[j])) + '\n')
+        
+        target = self.output()[-1]
+        assert isinstance(target, law.LocalFileTarget)
+        with open(target.path, 'w') as f:
+            assert isinstance(f, TextIOWrapper)
+            f.write(self.pois + '\n')
+            for point in points:
+                f.write(','.join(map(str, point)) + '\n')
+
+class GenerateGaussianProcess(POITask, HTCondorGPU):
+    def create_branch_map(self):
+        return [None] # Single branch, no special data
+            
+    def output(self):
+        targets = []
+        n_jobs = int(np.ceil(self.n_points / self.points_per_job))
+        start = 0
+        for i in range(n_jobs):
+            end = min(start + (self.points_per_job-1), self.n_points-1)
+            targets.append(self.local_target(f"gp_points{self.name_ext}{'_'.join(self.pois_split)}_{start}_{end}.txt"))
+            start += self.points_per_job
+        targets.append(self.local_target(f"gp_points{self.name_ext}{'_'.join(self.pois_split)}.txt"))
+        return targets
+    
+    def run(self):
+        assert self.block_index >= 1, "Cannot update Gaussian process for block 0, use GaussianProcessBase instead"
+        
+        # Parse the bounds
+        pois = self.COMBINE_POIS.split(',')
+        bounds = self.bounds
+        ranges = bounds[:, 1] - bounds[:, 0]
+        mins = bounds[:, 0]
+        
+        # Loop over all previous blocks
+        data = pd.DataFrame()
+        data_path = os.path.join(os.getenv("ANALYSIS_PATH"), 'data', 'HaddPOIs')
+        scan_pattern = f"scan.GP_*.{self.channel}.{self.model}.*.{self.POI_NAME_STR}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root"
+        files = glob.glob(os.path.join(data_path, scan_pattern))
+        for path in files:
+            # Read the block's output
+            file = uproot.open(path)
+            
+            # Access the values from the root file
+            tree = file["limit"]
+            block_data = pd.DataFrame(tree.arrays(pois + ['deltaNLL'], library="pd"))
+
+            # Concatenate the block's data to the DataFrame
+            data = pd.concat([data, block_data])
+        data = data.drop_duplicates().reset_index(drop=True)
+        
+        # Drop large deltaNLL values
+        data = data[data['deltaNLL'] <= 999]
+
+        # Setup gaussian processes
+        train_x = normalise(torch.from_numpy(data[pois].values), mins, ranges)
+        train_y = torch.from_numpy(data['deltaNLL'].values) / data['deltaNLL'].max()
+        print(f"5 sigma level: {25/data['deltaNLL'].max()}")
+        training_iter = 200
+        next_pts = []
+        next_ys = []
+        # print(bounds, ranges, mins)
+        
+        # Fit to the data and get the next n_batch points
+        k = 0
+        next_pts = []
+        next_ys = []
+        should_refit = True
+
+        likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=torch.full_like(train_y, 1e-8))
+        nn = min(train_x.shape[0] - 1, 50) 
+        model = GPModel(inducing_points=train_x, likelihood=likelihood, k=nn, training_batch_size=nn)
+
+        mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=train_y.size(0))
+        assert model.likelihood is not None
+        optimizer = torch.optim.Adam(model.parameters(), lr=5e-2)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
+        early_stopper = EarlyStopper(patience=5, min_delta=10)
+        
+        print("CUDA available:", torch.cuda.is_available())
+        
+        while k < self.points_per_block:
+            if torch.cuda.is_available():
+                likelihood = likelihood.cuda()
+                model = model.cuda()
+                train_x = train_x.cuda()
+                train_y = train_y.cuda()
+            
+            if k != 0:
+                training_iter = 50
+            # print(train_x.detach(), train_y.detach())
+            if should_refit:
+                model.train()
+                likelihood.train()
+                for i in range(training_iter):
+                    # Zero gradients from previous iteration
+                    optimizer.zero_grad()
+                    # Calc loss and backprop gradients
+                    output = model(train_x)
+                    _mll = mll(output, train_y)
+                    assert isinstance(_mll, torch.Tensor)
+                    loss = -_mll
+                    if early_stopper.early_stop(loss):
+                        print(f"Early stopping at iteration {i}")
+                        break
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    if i % 25 == 0:
+                        print(i, loss.item(), optimizer.param_groups[0]['lr'])
+
+            # Choose the next point to evaluate
+            model.eval()
+            likelihood.eval()
+            with torch.no_grad(), gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(1e-1):
+                test_x = torch.tensor(np.random.uniform(0, 1, size=(2000, bounds.shape[0])))
+                if torch.cuda.is_available():
+                    test_x = test_x.cuda()
+                posterior = model(test_x.float())
+                
+                # Mask high mean points
+                test_x = test_x[posterior.mean < 50 / data['deltaNLL'].max()]
+                posterior = model(test_x.float())
+                
+                # Get point with highest variance
+                _, idx = torch.max(posterior.variance, dim=0)
+                next_X = test_x[idx]
+                next_y = posterior.mean[idx].cpu()
+                next_y_var = posterior.variance[idx].cpu()
+                
+                # Throw a toy
+                toy = np.random.normal(loc=next_y, scale=np.sqrt(next_y_var))
+                if (toy <= (25 / data['deltaNLL'].max())) or (next_y <= (25 / data['deltaNLL'].max())):
+                    k += 1
+                    print(f"Got {k} points")
+                
+                    next_pts.append(next_X.cpu().detach().numpy())
+                    next_ys.append(next_y.cpu().detach().numpy())
+                    should_refit = True
+                    print(f"Picked {unnormalise(next_X.cpu().detach().numpy(), mins, ranges)}, mean={next_y}, std={np.sqrt(next_y_var)}, threw {toy}")
+                else:
+                    print(f"Rejected point, toy={toy}, mean={next_y}, std={np.sqrt(next_y_var)}")
+                    should_refit = False
+
+                # Add the point to the training set (temporarily) so we don't sample it again
+                train_x = torch.cat([train_x, next_X.unsqueeze(0).cuda()])
+                train_y = torch.cat([train_y, next_y.unsqueeze(-1).cuda()])
+                
+                # Update the model with the new point, rather than cold-starting
+                to_update = ['variational_strategy.inducing_points', 'variational_strategy._variational_distribution.variational_mean', 'variational_strategy._variational_distribution._variational_stddev']
+                new_state_dict = model.state_dict().copy()
+                for key, val in new_state_dict.items():
+                    if key in to_update:
+                        if 'inducing_points' in key:
+                            new_state_dict[key] = train_x
+                        elif 'variational_mean' in key:
+                            new_state_dict[key] = torch.cat([new_state_dict[key], torch.tensor(0).unsqueeze(0).cuda()])
+                        elif 'variational_stddev' in key:
+                            new_state_dict[key] = torch.cat([new_state_dict[key], torch.tensor(1e-3).unsqueeze(0).cuda()])
+
+                likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=torch.full_like(train_y, 1e-8))
+                nn = min(train_x.shape[0] - 1, 50) 
+                model = GPModel(inducing_points=train_x, likelihood=likelihood, k=nn, training_batch_size=nn)
+
+                mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=train_y.size(0))
+                assert model.likelihood is not None
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-2) # TODO rescale to 'fix' lr?
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
+                early_stopper = EarlyStopper(patience=5, min_delta=10)
+                model.load_state_dict(new_state_dict)
+
+        # Write to output to the correct files
+        points = np.array(next_pts)
         for i, target in enumerate(self.output()[:-1]):
             target = self.output()[i]
             assert isinstance(target, law.LocalFileTarget)
@@ -342,13 +543,17 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
     def workflow_requires(self):
         reqs = {'init': InitialFit.req(self)}
         if self.scan_method == 'rand':
-            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points)
+            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points, name_ext=self.name_ext)
+        elif self.scan_method == 'GP':
+            reqs['file'] = GenerateGaussianProcess.req(self)
         return reqs
     
     def requires(self):
         reqs = {'init': InitialFit.req(self)}
         if self.scan_method == 'rand':
-            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points)
+            reqs['file'] = GenerateRandom.req(self, pois=self.pois, n_points=self.n_points, name_ext=self.name_ext)
+        elif self.scan_method == 'GP':
+            reqs['file'] = GenerateGaussianProcess.req(self)
         return reqs
     
     def __init__(self, *args, **kwargs):
@@ -359,13 +564,18 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
         self.end = min(self.start + (self.points_per_job-1), self.n_points-1)
         self.scan_algos = {
             'grid': 'grid',
-            'rand': 'fixed'
+            'rand': 'fixed',
+            'GP'  : 'fixed'
         }
         self.algo = self.scan_algos.get(self.scan_method)
         if self.algo is None:
             raise ValueError(f"Scan method {self.scan_method} not recognised")
-        if self.scan_method == 'rand':
-            file_target = self.input()['file'][self.branch]
+        if self.algo == 'fixed':
+            try:
+                file_target = self.input()['file'][self.branch]
+            except KeyError:
+                # Guess that file target is a workflow
+                file_target = self.input()['file']['collection'][0][self.branch]
             assert isinstance(file_target, law.LocalFileTarget)
             self.file = file_target.path
         else:
@@ -403,49 +613,94 @@ class ScanPOIs(POITask, HTCondorCPU, law.LocalWorkflow):
             f" --generate {self.GENERATOR}"
             f" --freezeParameters MH{self.COMBINE_FREEZE} --redefineSignalPOIs {self.COMBINE_POIS}"
             f" --setParameterRanges {self.COMBINE_RANGES} {self.COMBINE_OPTIONS}"
-            f" -n .scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}"
+            f" -n .scan{self.name_ext}{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}"
             f" --snapshotName \"MultiDimFit\" --algo {self.algo} --saveInactivePOI 1"
             f" {self.SKIP_OPTIONS} {self.COMBINE_SET_OPTIONS}"
             f" --points {self.POINTS_STR} --alignEdges 1 {self.POIS_TO_RUN}"
             f" --firstPoint {self.start} --lastPoint {self.end}"
-            f"&> {self.output().dirname}/scan_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}_local.{self.branch}.log;"
+            f"&> {self.output().dirname}/scan_{self.name_ext}_{self.channel}_{self.model}_{self.scan_method}_{self.POI_NAME_STR}_local.{self.branch}.log;"
         )
         
         if self.file is not None:
             input_files = ""
             for i in range(self.end - self.start + 1):
                 input_files += os.path.join(os.getenv('ANALYSIS_PATH'), 
-                                            f'higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.POINTS.{i}.{i}.MultiDimFit.mH125.38.root ')
+                                            f'higgsCombine.scan{self.name_ext}{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.POINTS.{i}.{i}.MultiDimFit.mH125.38.root ')
             self.cmd += f"hadd -k -f {self.output().basename} {input_files};"
             self.cmd += f"rm {input_files};"
         
         self.cmd += f"mv {self.output().basename} {self.output().path}"
         
     def output(self):
-        return self.local_target(f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        return self.local_target(f"higgsCombine.scan{self.name_ext}{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.{self.start}.{self.end}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
     
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
         self.build_command()
         self.run_cmd(self.cmd)
 
-class HaddPOIs(POITask):
+class ScanBlock(POITask):
+    block_index = luigi.IntParameter()
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scan_method = 'GP' if self.block_index > 0 else 'rand'
+        self.block_task = HaddPOIs.req(self, scan_method=self.scan_method, 
+                                       n_points=self.points_per_block,
+                                       name_ext=f".GP_{self.block_index}.")
+        
     def requires(self):
-        return ScanPOIs.req(self, branch=-1)
+        if self.block_index == 0:
+            return []
+        else:
+            return ScanBlock.req(self, block_index=self.block_index-1)
     
     def output(self):
-        return self.local_target(f"scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        return self.block_task.output()
+
+    def run(self):
+        # Run the block by spawning the last task in the chain
+        yield self.block_task
+    
+class ScanBlocks(law.WrapperTask, POITask):
+    def requires(self):
+        return ScanBlock.req(self, block_index=self.block_index)
+    
+    def output(self):
+        return {
+            'collection' : law.TargetCollection(self.collect_block_outputs(self.block_index))
+            }
+
+    def collect_block_outputs(self, block_index):
+        if block_index < 0:
+            return {}
+        else:
+            scan_block = ScanBlock.req(self, block_index=block_index)
+            return {
+                f"block_{block_index}": scan_block.block_task.output(),
+                **self.collect_block_outputs(block_index - 1)
+            }
+
+class HaddPOIs(POITask):
+    def requires(self):
+        if self.scan_method == 'GP_blocks':
+            if self.points_per_block is None:
+                raise ValueError("GP scanning requires points_per_block to be set")
+            return ScanBlocks.req(self, block_index=int(np.ceil(self.n_points/self.points_per_block))-1)
+        else:
+            return ScanPOIs.req(self, branch=-1)
+    
+    def output(self):
+        return self.local_target(f"scan{self.name_ext}{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
     
     def run(self):
         logger.info(f"Running: {self.__class__.__name__} for {self.pois}, will output {self.output()}")
         scan_collection = self.input()['collection']
         assert isinstance(scan_collection, law.TargetCollection)
-        scan_target = scan_collection.first_target
-        assert isinstance(scan_target, law.LocalFileTarget)
-        input_files = os.path.join(scan_target.dirname,
-                                   f"higgsCombine.scan.{self.channel}.{self.model}.{self.scan_method}.{self.POI_NAME_STR}.POINTS.*.{self.types}.{self.attributes}.MultiDimFit.mH{self.MH}.root")
+        # TODO don't use private attributes
+        input_paths = list(map(lambda t: t.path, scan_collection._flat_target_list))
         cmd = self.base_command
-        cmd += f"hadd -k -f {self.output().path} {input_files};"
+        cmd += f"hadd -k -f {self.output().path} {' '.join(input_paths)};"
         self.run_cmd(cmd)
         
 class PlotPOIs(POITask):

@@ -11,12 +11,12 @@ from law.logger import get_logger
 logger = get_logger('luigi-interface')
 
 # Get a list of targets from a dict, list, tuple, or single target
-def targetAsList(target: Union[Dict, List, Tuple, law.LocalFileTarget]) -> List[law.LocalFileTarget]:
+def targetAsList(target: Union[Dict, List, Tuple, law.LocalFileTarget, law.TargetCollection]) -> List[law.LocalFileTarget]:
     if isinstance(target, dict):
         return list(target.values())
     elif isinstance(target, (list, tuple)):
         return target
-    elif isinstance(target, law.LocalFileTarget):
+    elif isinstance(target, (law.LocalFileTarget, law.TargetCollection)):
         return [target]
     else:
         raise ValueError(f"Invalid target type: {type(target)}")
