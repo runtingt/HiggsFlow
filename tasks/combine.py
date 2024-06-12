@@ -268,12 +268,13 @@ class CombineCards(CombineBase):
         return [Prepare.req(self, channel=card) for card in self.cards]
     
     def output(self):
-        return self.local_target(f"{self.cards_dir}/comb_2021_{self.model}.txt.gz")
+        # TODO change this to channel
+        return {'datacard' : self.local_target(f"{self.cards_dir}/comb_2021_{self.model}.txt.gz")}
     
     def run(self):
         print("Running CombineCards")
         
-        card_unzipped = os.path.splitext(self.output().path)[0]
+        card_unzipped = os.path.splitext(self.output()['datacard'].path)[0]
         cmd = self.base_command
         cmd += f"cd {self.cards_dir};"
         cmd += (
@@ -293,7 +294,11 @@ class TextToWorkspace(CombineBase):
         super().__init__(*args, **kwargs)
     
     def requires(self) -> law.Task:
-        return InputFiles.req(self) # Pass args through
+        if self.channel == "hgg_statonly":
+            return InputFiles.req(self)
+        else:
+            # TODO allow for standalone
+            return CombineCards.req(self)
     
     def output(self) -> law.LocalFileTarget:
         # Get the workspace name from the model
@@ -316,15 +321,16 @@ class TextToWorkspace(CombineBase):
         card_path = card_target.path
         logger.info(f"Running: TextToWorkspace, will output {self.output()}")
 
-        wsp_target = self.output()['workspace']
+        wsp_target = self.local_target(f"{self.wsp_file}.root")
         assert isinstance(wsp_target, law.LocalFileTarget) 
         # Build and run the command
         cmd = self.base_command
         cmd += (
             f"{self.time_command} text2workspace.py -o {wsp_target.basename} {card_path} {self.wsp_opts}"
             f" &> {outdir}/t2w_{self.channel}_{self.model}_local.log;"
-            f" mv {wsp_target.basename} {wsp_target.path}"
         )
+        cmd += f"python3 addAttributes.py -i {wsp_target.basename} --json attributes.json -o {self.output()['workspace'].path}; "
+        cmd += f"mv {wsp_target.basename} {wsp_target.path};"
         self.run_cmd(cmd)
 
 class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):    
@@ -368,6 +374,11 @@ class InitialFit(CombineBase, HTCondorCPU, law.LocalWorkflow):
         self.run_cmd(cmd)
         
 class Impacts(CombineBase, HTCondorCPU, law.LocalWorkflow):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.channel != "hgg_statonly":
+            self.COMBINE_FREEZE = ",rgx{prop.*}" + self.COMBINE_FREEZE
+    
     def create_branch_map(self):
         return [None] # Single branch, no special data
     
@@ -392,7 +403,6 @@ class Impacts(CombineBase, HTCondorCPU, law.LocalWorkflow):
         if self.types == "observed":
             dataset = "data_obs"
         cmd = self.base_command
-        # TODO include rgx{prop.*} in the freeze list (this breaks hgg_statonly atm)
         cmd += (
             f"{self.time_command} combineTool.py -M MultiDimFit "
             f"-m {self.MH} -d {initial_path} "
