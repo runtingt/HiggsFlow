@@ -2775,9 +2775,12 @@ def GetT2WOpts(model):
         raise ValueError("Model has no t2w options. Probably wrong.")
         return opts
 
-def GetCards(model,sep=' '):
+def GetCards(model,sep=' ', full_name=True):
     cards = getPOIs[model]["cards"][:]
-    full= ['comb_2021_'+c+'.txt.gz' for c in cards]
+    if full_name:
+        full= ['comb_2021_'+c+'.txt.gz' for c in cards]
+    else:
+        full = cards
     return sep.join(full)
 
 def GetUncertainties(model):

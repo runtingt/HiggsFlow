@@ -14,7 +14,7 @@ import glob
 from gaussianProcesses.base import GPModel, EarlyStopper, normalise, unnormalise
 from io import TextIOWrapper
 from typing import Dict
-from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList, SetSMVals
+from getPOIs import GetWsp, GetT2WOpts, GetMinimizerOpts, GetPOIsList, GetPOIRanges, GetFreezeList, SetSMVals, GetCards, GetUncertainties
 from itertools import combinations
 from tasks.base import ForceableWithNewer
 from tasks.remote import HTCondorCPU, HTCondorGPU
@@ -95,6 +95,9 @@ class CombineBase(ForceableWithNewer):
         # Define frequently used commands
         self.base_command = f"cd {os.environ['CMSSW_PATH']}; cmsenv; cd {os.environ['ANALYSIS_PATH']}; ulimit -s unlimited; "
         self.time_command = "/usr/bin/time -v"
+        
+        # Set cards directory
+        self.cards_dir = os.path.join(os.getenv("HC_PATH"), "cards")
         
         # Parse the model
         self.COMBINE_OPTIONS = GetMinimizerOpts(self.model)
@@ -210,7 +213,6 @@ class Prepare(CombineBase):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cards_dir = os.path.join(os.getenv("HC_PATH"), "cards")
         os.makedirs(self.cards_dir, exist_ok=True)
     
     def requires(self):
@@ -222,7 +224,7 @@ class Prepare(CombineBase):
     def output(self):
         return {
             'log' : self.local_target(f"log.{self.channel}.txt"),
-            'card' : law.LocalFileTarget(f"{self.cards_dir}/comb_2021_{self.channel}.txt.gz"),
+            'datacard' : law.LocalFileTarget(f"{self.cards_dir}/comb_2021_{self.channel}.txt.gz"),
             'inputs' : law.LocalFileTarget(f"{self.cards_dir}/comb_2021_{self.channel}.inputs.root"),
         }
     
@@ -250,9 +252,39 @@ class Prepare(CombineBase):
             self.run_cmd("gzip $HC_PATH/comb_2021_hmm.txt")
 
         # Move output of prepare step into the cards directory
-        self.run_cmd(f"mv -v $HC_PATH/comb_2021_{self.channel}.txt.gz {self.output()['card'].path}")
+        self.run_cmd(f"mv -v $HC_PATH/comb_2021_{self.channel}.txt.gz {self.output()['datacard'].path}")
         self.run_cmd(f"mv -v $HC_PATH/comb_2021_{self.channel}.inputs.root {self.output()['inputs'].path}")
 
+class CombineCards(CombineBase):
+    """
+    Combines cards according to a model defined in getPOIS.py
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cards = GetCards(self.model, sep=',', full_name=False).split(',')
+        self.card_names = GetCards(self.model)
+
+    def requires(self):
+        return [Prepare.req(self, channel=card) for card in self.cards]
+    
+    def output(self):
+        return self.local_target(f"{self.cards_dir}/comb_2021_{self.model}.txt.gz")
+    
+    def run(self):
+        print("Running CombineCards")
+        
+        card_unzipped = os.path.splitext(self.output().path)[0]
+        cmd = self.base_command
+        cmd += f"cd {self.cards_dir};"
+        cmd += (
+            f"{self.time_command} combineCards.py "
+            f"-S {self.card_names} > {card_unzipped};"
+        )
+        cmd += "cd $ANALYSIS_PATH;"
+        # cmd += f"cat {GetUncertainties(self.model)} >> {card_unzipped}" # TODO handle uncertainties (these are paths, so need pointing to the right place)
+        cmd += f"gzip {card_unzipped}"
+        self.run_cmd(cmd)
+        
 class TextToWorkspace(CombineBase):
     """
     Convert a text file and an input file to a RooWorkspace.
